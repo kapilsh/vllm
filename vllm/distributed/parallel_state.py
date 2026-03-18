@@ -43,6 +43,7 @@ import torch.distributed._symmetric_memory
 from torch.distributed import Backend, ProcessGroup
 
 import vllm.envs as envs
+from vllm.distributed.bootstrap import BootstrapProvider, ProcessGroupBootstrap
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,
 )
@@ -321,37 +322,28 @@ class GroupCoordinator:
         use_device_communicator: bool,  # whether to use device communicator
         use_message_queue_broadcaster: bool = False,
         group_name: str | None = None,
+        bootstrap_provider: BootstrapProvider | None = None,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
         _register_group(self)
 
-        self.rank = torch.distributed.get_rank()
         self.local_rank = local_rank
 
-        self_device_group = None
-        self_cpu_group = None
+        if bootstrap_provider is None:
+            bootstrap_provider = ProcessGroupBootstrap()
 
-        for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
-            )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            with suppress_stdout():
-                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
-            if self.rank in ranks:
-                self.ranks = ranks
-                self.world_size = len(ranks)
-                self.rank_in_group = ranks.index(self.rank)
-                self_device_group = device_group
-                self_cpu_group = cpu_group
-
-        assert self_cpu_group is not None
-        assert self_device_group is not None
-
-        self.cpu_group = self_cpu_group
-        self.device_group = self_device_group
+        info = bootstrap_provider.create_group(
+            group_ranks,
+            torch.distributed.get_rank(),
+            str(torch_distributed_backend),
+        )
+        self.rank = info.rank
+        self.ranks = info.ranks
+        self.world_size = info.world_size
+        self.rank_in_group = info.rank_in_group
+        self.cpu_group = info.cpu_group
+        self.device_group = info.device_group
 
         from vllm.platforms import current_platform
 
@@ -1132,7 +1124,10 @@ def get_inner_dp_world_group() -> GroupCoordinator:
 
 
 def init_world_group(
-    ranks: list[int], local_rank: int, backend: str
+    ranks: list[int],
+    local_rank: int,
+    backend: str,
+    bootstrap_provider: BootstrapProvider | None = None,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=[ranks],
@@ -1140,6 +1135,7 @@ def init_world_group(
         torch_distributed_backend=backend,
         use_device_communicator=False,
         group_name="world",
+        bootstrap_provider=bootstrap_provider,
     )
 
 
@@ -1150,6 +1146,7 @@ def init_model_parallel_group(
     use_message_queue_broadcaster: bool = False,
     group_name: str | None = None,
     use_device_communicator: bool = True,
+    bootstrap_provider: BootstrapProvider | None = None,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=group_ranks,
@@ -1158,6 +1155,7 @@ def init_model_parallel_group(
         use_device_communicator=use_device_communicator,
         use_message_queue_broadcaster=use_message_queue_broadcaster,
         group_name=group_name,
+        bootstrap_provider=bootstrap_provider,
     )
 
 
