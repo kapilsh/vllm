@@ -331,7 +331,9 @@ class GroupCoordinator:
         self.local_rank = local_rank
 
         if bootstrap_provider is None:
-            bootstrap_provider = ProcessGroupBootstrap()
+            bootstrap_provider = (
+                _DEFAULT_BOOTSTRAP_PROVIDER or ProcessGroupBootstrap()
+            )
 
         info = bootstrap_provider.create_group(
             group_ranks,
@@ -344,6 +346,8 @@ class GroupCoordinator:
         self.rank_in_group = info.rank_in_group
         self.cpu_group = info.cpu_group
         self.device_group = info.device_group
+        self.device_comm = info.device_comm  # TorchComm (may be None)
+        self.cpu_comm = info.cpu_comm  # TorchComm (may be None)
 
         from vllm.platforms import current_platform
 
@@ -359,15 +363,27 @@ class GroupCoordinator:
         self.use_device_communicator = use_device_communicator
         self.device_communicator = None
         if use_device_communicator and self.world_size > 1:
-            device_comm_cls = resolve_obj_by_qualname(
-                current_platform.get_device_communicator_cls()
-            )
-            self.device_communicator = device_comm_cls(
-                cpu_group=self.cpu_group,
-                device=self.device,
-                device_group=self.device_group,
-                unique_name=self.unique_name,
-            )
+            if self.device_comm is not None:
+                from vllm.distributed.device_communicators.torchcomm_communicator import (
+                    TorchCommDeviceCommunicator,
+                )
+                self.device_communicator = TorchCommDeviceCommunicator(
+                    cpu_group=self.cpu_group,
+                    device=self.device,
+                    device_group=self.device_group,
+                    device_comm=self.device_comm,
+                    unique_name=self.unique_name,
+                )
+            else:
+                device_comm_cls = resolve_obj_by_qualname(
+                    current_platform.get_device_communicator_cls()
+                )
+                self.device_communicator = device_comm_cls(
+                    cpu_group=self.cpu_group,
+                    device=self.device,
+                    device_group=self.device_group,
+                    unique_name=self.unique_name,
+                )
 
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
@@ -1299,10 +1315,22 @@ logger = init_logger(__name__)
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
 
+# Module-level bootstrap provider override. When set, GroupCoordinator uses
+# this instead of the default ProcessGroupBootstrap.
+_DEFAULT_BOOTSTRAP_PROVIDER: BootstrapProvider | None = None
+
 
 def set_custom_all_reduce(enable: bool):
     global _ENABLE_CUSTOM_ALL_REDUCE
     _ENABLE_CUSTOM_ALL_REDUCE = enable
+
+
+def set_default_bootstrap_provider(
+    provider: BootstrapProvider | None,
+) -> None:
+    """Set a module-level default BootstrapProvider for all new groups."""
+    global _DEFAULT_BOOTSTRAP_PROVIDER
+    _DEFAULT_BOOTSTRAP_PROVIDER = provider
 
 
 def _init_elastic_ep_world(

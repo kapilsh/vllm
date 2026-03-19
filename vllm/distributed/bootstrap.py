@@ -9,8 +9,11 @@ that lives in GroupCoordinator.
 
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import timedelta
+from typing import Any
 
 import torch
 import torch.distributed
@@ -25,8 +28,10 @@ class BootstrapInfo:
     ranks: list[int]  # global ranks participating in the group
     world_size: int  # number of ranks in the group
     rank_in_group: int  # index of this rank within *ranks*
-    cpu_group: ProcessGroup  # gloo group for CPU coordination
-    device_group: ProcessGroup  # group for device (e.g. NCCL) communication
+    cpu_group: ProcessGroup | None = None  # gloo group for CPU coordination
+    device_group: ProcessGroup | None = None  # device (NCCL) group
+    device_comm: Any | None = None  # TorchComm for device communication
+    cpu_comm: Any | None = None  # TorchComm for CPU (gloo) communication
 
 
 class BootstrapProvider(ABC):
@@ -109,4 +114,129 @@ class ProcessGroupBootstrap(BootstrapProvider):
             rank_in_group=result_ranks.index(global_rank),
             cpu_group=result_cpu_group,
             device_group=result_device_group,
+        )
+
+
+class TorchcommsBootstrap(BootstrapProvider):
+    """Hybrid bootstrap: ProcessGroups + TorchComm communicators.
+
+    Creates standard ``torch.distributed`` ProcessGroups (needed by
+    ``GroupCoordinator`` for object-level communication such as
+    ``broadcast_object``, ``send_object``, ``recv_object``, and
+    ``MessageQueue``) **and** TorchComm communicators for device-level
+    collectives (``all_reduce``, ``all_gather``, etc.).
+
+    Precondition: ``torch.distributed.init_process_group()`` must have
+    been called before using this provider (same as
+    ``ProcessGroupBootstrap``).
+    """
+
+    def __init__(
+        self,
+        store: torch.distributed.Store | None = None,
+        device: torch.device | None = None,
+        timeout: timedelta | None = None,
+        group_name: str | None = None,
+    ) -> None:
+        self._store = store
+        self._device = device
+        self._timeout = timeout or timedelta(seconds=300)
+        self._group_name = group_name or "vllm"
+        # Lazily-created world-level communicators.
+        self._world_device_comm: Any | None = None
+        self._world_cpu_comm: Any | None = None
+        # Counter to generate unique sub-comm names across split() calls.
+        self._split_counter: int = 0
+        # Delegate for ProcessGroup creation.
+        self._pg_bootstrap = ProcessGroupBootstrap()
+
+    def _get_store(self) -> torch.distributed.Store:
+        """Return the provided store or create a TCPStore from env vars."""
+        if self._store is not None:
+            return self._store
+        master_addr = os.environ["MASTER_ADDR"]
+        master_port = int(os.environ["MASTER_PORT"])
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ["WORLD_SIZE"])
+        return torch.distributed.TCPStore(
+            host_name=master_addr,
+            port=master_port,
+            world_size=world_size,
+            is_master=(rank == 0),
+            timeout=self._timeout,
+        )
+
+    def _ensure_world_comms(self, backend: str) -> None:
+        """Create world-level device and CPU comms if not already created."""
+        if self._world_device_comm is not None:
+            return
+
+        import torchcomms
+
+        store = self._get_store()
+        device = self._device or torch.device("cuda", int(
+            os.environ.get("LOCAL_RANK", "0")
+        ))
+
+        device_store = torch.distributed.PrefixStore(
+            f"{self._group_name}/device", store
+        )
+        self._world_device_comm = torchcomms.new_comm(
+            backend,
+            device,
+            name=f"{self._group_name}_world_device",
+            store=device_store,
+            timeout=self._timeout,
+        )
+
+        cpu_store = torch.distributed.PrefixStore(
+            f"{self._group_name}/cpu", store
+        )
+        cpu_device = torch.device("cpu")
+        self._world_cpu_comm = torchcomms.new_comm(
+            "gloo",
+            cpu_device,
+            name=f"{self._group_name}_world_cpu",
+            store=cpu_store,
+            timeout=self._timeout,
+        )
+
+    def create_group(
+        self,
+        group_ranks: list[list[int]],
+        global_rank: int,
+        backend: str,
+    ) -> BootstrapInfo:
+        # 1. Create ProcessGroups via the standard path.
+        pg_info = self._pg_bootstrap.create_group(
+            group_ranks, global_rank, backend
+        )
+
+        # 2. Create TorchComm communicators.
+        self._ensure_world_comms(backend)
+
+        split_id = self._split_counter
+        self._split_counter += 1
+
+        device_sub = self._world_device_comm.split(
+            group_ranks,
+            name=f"{self._group_name}_device_split{split_id}",
+            timeout=self._timeout,
+        )
+        cpu_sub = self._world_cpu_comm.split(
+            group_ranks,
+            name=f"{self._group_name}_cpu_split{split_id}",
+            timeout=self._timeout,
+        )
+
+        # 3. Return combined info: PGs + TorchComm objects.
+        return BootstrapInfo(
+            rank=pg_info.rank,
+            ranks=pg_info.ranks,
+            world_size=pg_info.world_size,
+            rank_in_group=pg_info.rank_in_group,
+            cpu_group=pg_info.cpu_group,
+            device_group=pg_info.device_group,
+            device_comm=device_sub,
+            cpu_comm=cpu_sub,
         )
