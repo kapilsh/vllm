@@ -1,0 +1,12 @@
+*.so
+*.a
+*.o
+__pycache__
+.git
+build
+*.egg-info
+.deps
+docs
+.buildkite
+.github
+docker
