@@ -9,6 +9,7 @@ that lives in GroupCoordinator.
 
 from __future__ import annotations
 
+import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ from typing import Any
 import torch
 import torch.distributed
 from torch.distributed import ProcessGroup
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -150,37 +153,103 @@ class TorchcommsBootstrap(BootstrapProvider):
         # Delegate for ProcessGroup creation.
         self._pg_bootstrap = ProcessGroupBootstrap()
 
+        logger.info("[torchcomms] TorchcommsBootstrap created: "
+                    "group_name=%s, timeout=%s, store=%s, device=%s",
+                    self._group_name, self._timeout,
+                    type(store).__name__ if store else "None",
+                    device)
+
     def _get_store(self) -> torch.distributed.Store:
-        """Return the provided store or create a TCPStore from env vars."""
+        """Return the provided store or get it from the default process group.
+
+        When vLLM uses multiproc executor, it initializes torch.distributed
+        with ``init_method=tcp://host:port`` rather than ``env://``, so
+        MASTER_ADDR/MASTER_PORT env vars are not set.  We fall back to the
+        store that ``init_process_group`` already created.
+        """
         if self._store is not None:
+            logger.info("[torchcomms] Using user-provided store: %s",
+                        type(self._store).__name__)
             return self._store
-        master_addr = os.environ["MASTER_ADDR"]
-        master_port = int(os.environ["MASTER_PORT"])
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        return torch.distributed.TCPStore(
-            host_name=master_addr,
-            port=master_port,
-            world_size=world_size,
-            is_master=(rank == 0),
-            timeout=self._timeout,
-        )
+        from torch.distributed.distributed_c10d import _get_default_store
+        store = _get_default_store()
+        logger.info("[torchcomms] Using default store from "
+                    "torch.distributed: %s", type(store).__name__)
+        return store
 
     def _ensure_world_comms(self, backend: str) -> None:
         """Create world-level device and CPU comms if not already created."""
         if self._world_device_comm is not None:
+            logger.debug("[torchcomms] World comms already initialized, "
+                         "skipping")
             return
 
         import torchcomms
 
+        logger.info("[torchcomms] Initializing world-level communicators "
+                    "(backend=%s, group=%s, timeout=%s)",
+                    backend, self._group_name, self._timeout)
+
         store = self._get_store()
-        device = self._device or torch.device("cuda", int(
-            os.environ.get("LOCAL_RANK", "0")
-        ))
+        device = self._device or torch.device("cuda", torch.cuda.current_device())
+        logger.info("[torchcomms] Device for world comms: %s", device)
+
+        # torchcomms.new_comm() and its backends read RANK, WORLD_SIZE,
+        # LOCAL_RANK, MASTER_ADDR, and MASTER_PORT from env vars.  vLLM's
+        # multiproc executor doesn't set these (it uses tcp:// init_method
+        # instead of env://), so we populate them from the already-initialized
+        # torch.distributed and the underlying TCPStore.
+        env_vars_set = []
+        if "RANK" not in os.environ:
+            os.environ["RANK"] = str(torch.distributed.get_rank())
+            env_vars_set.append(f"RANK={os.environ['RANK']}")
+        if "WORLD_SIZE" not in os.environ:
+            os.environ["WORLD_SIZE"] = str(torch.distributed.get_world_size())
+            env_vars_set.append(f"WORLD_SIZE={os.environ['WORLD_SIZE']}")
+        if "LOCAL_RANK" not in os.environ:
+            os.environ["LOCAL_RANK"] = str(device.index)
+            env_vars_set.append(f"LOCAL_RANK={os.environ['LOCAL_RANK']}")
+        if "MASTER_ADDR" not in os.environ or "MASTER_PORT" not in os.environ:
+            # Unwrap PrefixStore layers to find the underlying TCPStore
+            underlying = store
+            prefix_layers = []
+            while isinstance(underlying, torch.distributed.PrefixStore):
+                prefix_layers.append(type(underlying).__name__)
+                underlying = underlying.underlying_store
+            if prefix_layers:
+                logger.info("[torchcomms] Unwrapped %d PrefixStore layers "
+                            "to reach %s",
+                            len(prefix_layers), type(underlying).__name__)
+            if isinstance(underlying, torch.distributed.TCPStore):
+                os.environ.setdefault("MASTER_ADDR", underlying.host)
+                os.environ.setdefault("MASTER_PORT", str(underlying.port))
+                env_vars_set.append(f"MASTER_ADDR={underlying.host}")
+                env_vars_set.append(f"MASTER_PORT={underlying.port}")
+            else:
+                # Fallback for local single-node usage
+                os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+                os.environ.setdefault("MASTER_PORT", "29500")
+                env_vars_set.append("MASTER_ADDR=127.0.0.1 (fallback)")
+                env_vars_set.append("MASTER_PORT=29500 (fallback)")
+
+        if env_vars_set:
+            logger.info("[torchcomms] Populated env vars for torchcomms: %s",
+                        ", ".join(env_vars_set))
+        else:
+            logger.info("[torchcomms] All env vars already set "
+                        "(RANK=%s, WORLD_SIZE=%s, LOCAL_RANK=%s, "
+                        "MASTER_ADDR=%s, MASTER_PORT=%s)",
+                        os.environ.get("RANK"), os.environ.get("WORLD_SIZE"),
+                        os.environ.get("LOCAL_RANK"),
+                        os.environ.get("MASTER_ADDR"),
+                        os.environ.get("MASTER_PORT"))
 
         device_store = torch.distributed.PrefixStore(
             f"{self._group_name}/device", store
         )
+        logger.info("[torchcomms] Creating world device comm "
+                    "(name=%s_world_device, backend=%s, device=%s)",
+                    self._group_name, backend, device)
         self._world_device_comm = torchcomms.new_comm(
             backend,
             device,
@@ -188,11 +257,16 @@ class TorchcommsBootstrap(BootstrapProvider):
             store=device_store,
             timeout=self._timeout,
         )
+        logger.info("[torchcomms] World device comm created: %s",
+                    self._world_device_comm)
 
         cpu_store = torch.distributed.PrefixStore(
             f"{self._group_name}/cpu", store
         )
         cpu_device = torch.device("cpu")
+        logger.info("[torchcomms] Creating world CPU comm "
+                    "(name=%s_world_cpu, backend=gloo, device=%s)",
+                    self._group_name, cpu_device)
         self._world_cpu_comm = torchcomms.new_comm(
             "gloo",
             cpu_device,
@@ -200,6 +274,9 @@ class TorchcommsBootstrap(BootstrapProvider):
             store=cpu_store,
             timeout=self._timeout,
         )
+        logger.info("[torchcomms] World CPU comm created: %s",
+                    self._world_cpu_comm)
+        logger.info("[torchcomms] World-level communicator init complete")
 
     def create_group(
         self,
@@ -207,29 +284,73 @@ class TorchcommsBootstrap(BootstrapProvider):
         global_rank: int,
         backend: str,
     ) -> BootstrapInfo:
+        logger.info("[torchcomms] create_group called: "
+                    "group_ranks=%s, global_rank=%d, backend=%s",
+                    group_ranks, global_rank, backend)
+
         # 1. Create ProcessGroups via the standard path.
+        logger.info("[torchcomms] Step 1/3: Creating ProcessGroups "
+                    "via standard torch.distributed path")
         pg_info = self._pg_bootstrap.create_group(
             group_ranks, global_rank, backend
         )
+        logger.info("[torchcomms] ProcessGroups created: "
+                    "rank=%d, ranks=%s, world_size=%d, rank_in_group=%d, "
+                    "device_group=%s, cpu_group=%s",
+                    pg_info.rank, pg_info.ranks, pg_info.world_size,
+                    pg_info.rank_in_group, pg_info.device_group,
+                    pg_info.cpu_group)
 
         # 2. Create TorchComm communicators.
+        logger.info("[torchcomms] Step 2/3: Ensuring world-level "
+                    "TorchComm communicators")
         self._ensure_world_comms(backend)
 
         split_id = self._split_counter
         self._split_counter += 1
 
+        # group_ranks is a list of rank-groups (e.g. [[0,1], [2,3]]).
+        # torchcomms.split() expects the flat rank list for the subgroup
+        # that this process belongs to.
+        my_ranks = None
+        for ranks in group_ranks:
+            if global_rank in ranks:
+                my_ranks = ranks
+                break
+        if my_ranks is None:
+            my_ranks = group_ranks[0]
+            logger.warning("[torchcomms] global_rank %d not found in any "
+                           "group_ranks, defaulting to first group: %s",
+                           global_rank, my_ranks)
+
+        logger.info("[torchcomms] Step 3/3: Splitting world comms for "
+                    "subgroup (split_id=%d, my_ranks=%s)",
+                    split_id, my_ranks)
+
         device_sub = self._world_device_comm.split(
-            group_ranks,
+            my_ranks,
             name=f"{self._group_name}_device_split{split_id}",
             timeout=self._timeout,
         )
+        logger.info("[torchcomms] Device sub-comm created: "
+                    "name=%s_device_split%d, comm=%s",
+                    self._group_name, split_id, device_sub)
+
         cpu_sub = self._world_cpu_comm.split(
-            group_ranks,
+            my_ranks,
             name=f"{self._group_name}_cpu_split{split_id}",
             timeout=self._timeout,
         )
+        logger.info("[torchcomms] CPU sub-comm created: "
+                    "name=%s_cpu_split%d, comm=%s",
+                    self._group_name, split_id, cpu_sub)
 
         # 3. Return combined info: PGs + TorchComm objects.
+        logger.info("[torchcomms] create_group complete for "
+                    "global_rank=%d: split_id=%d, "
+                    "world_size=%d, rank_in_group=%d",
+                    global_rank, split_id,
+                    pg_info.world_size, pg_info.rank_in_group)
         return BootstrapInfo(
             rank=pg_info.rank,
             ranks=pg_info.ranks,

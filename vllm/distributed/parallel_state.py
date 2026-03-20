@@ -338,6 +338,11 @@ class GroupCoordinator:
                 _DEFAULT_BOOTSTRAP_PROVIDER or ProcessGroupBootstrap()
             )
 
+        logger.info("GroupCoordinator[%s]: using bootstrap provider %s "
+                     "(group_ranks=%s, backend=%s)",
+                     group_name, type(bootstrap_provider).__name__,
+                     group_ranks, torch_distributed_backend)
+
         info = bootstrap_provider.create_group(
             group_ranks,
             torch.distributed.get_rank(),
@@ -351,6 +356,16 @@ class GroupCoordinator:
         self.device_group = info.device_group
         self.device_comm = info.device_comm  # TorchComm (may be None)
         self.cpu_comm = info.cpu_comm  # TorchComm (may be None)
+
+        logger.info("GroupCoordinator[%s]: bootstrap complete — "
+                     "rank=%d, world_size=%d, rank_in_group=%d, "
+                     "device_comm=%s, cpu_comm=%s",
+                     group_name, self.rank, self.world_size,
+                     self.rank_in_group,
+                     type(self.device_comm).__name__
+                     if self.device_comm else "None",
+                     type(self.cpu_comm).__name__
+                     if self.cpu_comm else "None")
 
         from vllm.platforms import current_platform
 
@@ -370,6 +385,9 @@ class GroupCoordinator:
                 from vllm.distributed.device_communicators.torchcomm_communicator import (
                     TorchCommDeviceCommunicator,
                 )
+                logger.info("GroupCoordinator[%s]: using "
+                            "TorchCommDeviceCommunicator (torchcomms path)",
+                            group_name)
                 self.device_communicator = TorchCommDeviceCommunicator(
                     cpu_group=self.cpu_group,
                     device=self.device,
@@ -381,12 +399,21 @@ class GroupCoordinator:
                 device_comm_cls = resolve_obj_by_qualname(
                     current_platform.get_device_communicator_cls()
                 )
+                logger.info("GroupCoordinator[%s]: using platform "
+                            "communicator %s (standard path)",
+                            group_name, device_comm_cls.__name__)
                 self.device_communicator = device_comm_cls(
                     cpu_group=self.cpu_group,
                     device=self.device,
                     device_group=self.device_group,
                     unique_name=self.unique_name,
                 )
+        elif not use_device_communicator:
+            logger.info("GroupCoordinator[%s]: device communicator disabled",
+                        group_name)
+        else:
+            logger.info("GroupCoordinator[%s]: world_size=1, "
+                        "skipping device communicator", group_name)
 
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
@@ -482,11 +509,18 @@ class GroupCoordinator:
             CudaCommunicator,
         )
 
-        if self.device_communicator is not None:
-            assert isinstance(self.device_communicator, CudaCommunicator)
+        if self.device_communicator is not None and isinstance(
+            self.device_communicator, CudaCommunicator
+        ):
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
                 maybe_ca_context = ca_comm.capture()  # type: ignore
+            logger.info("graph_capture: using CudaCommunicator "
+                        "(ca_comm=%s)", ca_comm is not None)
+        elif self.device_communicator is not None:
+            logger.info("graph_capture: using %s (no custom allreduce "
+                        "capture needed)",
+                        type(self.device_communicator).__name__)
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
