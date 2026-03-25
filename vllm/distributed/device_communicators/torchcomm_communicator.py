@@ -10,7 +10,6 @@ ProcessGroups for metadata/object-level communication.
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 from typing import Any
 
 import torch
@@ -42,27 +41,15 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
             "TorchCommDeviceCommunicator requires a TorchComm object"
         )
         self.comm = device_comm
-        self._call_counts: dict[str, int] = defaultdict(int)
-        self._log_interval = 100  # log summary every N calls per op
         logger.info("[torchcomms] TorchCommDeviceCommunicator initialized: "
                      "unique_name=%s, device=%s, rank=%d, world_size=%d, "
                      "comm=%s",
                      unique_name, device, self.rank, self.world_size,
                      device_comm)
 
-    def _log_op(self, op: str, shape: torch.Size, dtype: torch.dtype) -> None:
-        self._call_counts[op] += 1
-        count = self._call_counts[op]
-        if count <= 3 or count % self._log_interval == 0:
-            logger.info("[torchcomms] %s #%d: shape=%s, dtype=%s, "
-                        "rank=%d, comm=%s",
-                        op, count, list(shape), dtype,
-                        self.rank, self.unique_name)
-
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         import torchcomms
 
-        self._log_op("all_reduce", input_.shape, input_.dtype)
         self.comm.all_reduce(input_, torchcomms.ReduceOp.SUM, async_op=False)
         return input_
 
@@ -72,8 +59,6 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
         if dim < 0:
             dim += input_.dim()
         input_size = input_.size()
-
-        self._log_op("all_gather", input_.shape, input_.dtype)
 
         # Allocate flat output for all_gather_single.
         output_size = (input_size[0] * self.world_size,) + input_size[1:]
@@ -109,8 +94,6 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
 
         import torchcomms
 
-        self._log_op("reduce_scatter", input_.shape, input_.dtype)
-
         input_tensor = input_.movedim(0, dim).contiguous()
 
         assert input_tensor.shape[0] % self.world_size == 0
@@ -130,14 +113,12 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         if self.world_size == 1:
             return tensor
-        self._log_op("broadcast", tensor.shape, tensor.dtype)
         self.comm.broadcast(tensor, src, async_op=False)
         return tensor
 
     def send(self, tensor: torch.Tensor, dst: int | None = None) -> None:
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
-        self._log_op("send", tensor.shape, tensor.dtype)
         self.comm.send(tensor, dst, async_op=False)
 
     def recv(
@@ -146,7 +127,6 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
         if src is None:
             src = (self.rank_in_group - 1) % self.world_size
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        self._log_op("recv", tensor.shape, tensor.dtype)
         self.comm.recv(tensor, src, async_op=False)
         return tensor
 
@@ -158,8 +138,6 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
         )
         if dim < 0:
             dim += input_.dim()
-
-        self._log_op("gather", input_.shape, input_.dtype)
 
         if self.rank_in_group == dst:
             gather_list = [
