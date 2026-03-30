@@ -434,6 +434,7 @@ class EngineArgs:
     data_parallel_hybrid_lb: bool = False
     data_parallel_external_lb: bool = False
     data_parallel_backend: DataParallelBackend = ParallelConfig.data_parallel_backend
+    use_torchcomms: bool = ParallelConfig.use_torchcomms
     enable_expert_parallel: bool = ParallelConfig.enable_expert_parallel
     enable_ep_weight_filter: bool = ParallelConfig.enable_ep_weight_filter
     moe_backend: MoEBackend = KernelConfig.moe_backend
@@ -1807,6 +1808,7 @@ class EngineArgs:
             data_parallel_backend=self.data_parallel_backend,
             data_parallel_hybrid_lb=self.data_parallel_hybrid_lb,
             is_moe_model=model_config.is_moe,
+            use_torchcomms=self.use_torchcomms,
             enable_expert_parallel=self.enable_expert_parallel,
             enable_ep_weight_filter=self.enable_ep_weight_filter,
             all2all_backend=self.all2all_backend,

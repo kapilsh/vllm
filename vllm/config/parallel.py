@@ -184,6 +184,12 @@ class ParallelConfig:
     sequentially in multiple batches. To avoid RAM OOM when using tensor
     parallel and large models."""
 
+    use_torchcomms: bool = False
+    """Use TorchComm communicators for device collectives instead of the
+    platform default (e.g. NCCL).  When enabled, a TorchcommsBootstrap
+    provider is set in every worker process so that GroupCoordinator creates
+    TorchCommDeviceCommunicator instances."""
+
     disable_custom_all_reduce: bool = False
     """Disable the custom all-reduce kernel and fall back to NCCL."""
 
