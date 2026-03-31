@@ -368,6 +368,156 @@ class TorchcommsBootstrapTest(unittest.TestCase):
             self.assertIs(call[0][1], custom_store)
 
 
+class TorchcommsBootstrapPgFreeTest(unittest.TestCase):
+    """Tests for TorchcommsBootstrap with pg_free=True."""
+
+    ENV_VARS = {
+        "RANK": "0",
+        "WORLD_SIZE": "4",
+        "LOCAL_RANK": "0",
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": "29500",
+    }
+
+    def _make_mock_torchcomms(self):
+        """Create a mock torchcomms module with new_comm."""
+        mock_mod = MagicMock()
+        mock_world_comm = MagicMock(name="world_comm")
+        mock_sub_comm = MagicMock(name="sub_comm")
+        mock_world_comm.split.return_value = mock_sub_comm
+        mock_mod.new_comm.return_value = mock_world_comm
+        return mock_mod, mock_world_comm, mock_sub_comm
+
+    @patch.dict("os.environ", ENV_VARS)
+    @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
+    @patch.object(ProcessGroupBootstrap, "create_group")
+    def test_pg_free_skips_process_groups(
+        self, mock_pg_create, mock_prefix_store
+    ):
+        """When pg_free=True, ProcessGroupBootstrap.create_group is NOT
+        called, but TorchComm communicators are still created."""
+        mock_torchcomms, mock_world_comm, mock_sub_comm = (
+            self._make_mock_torchcomms()
+        )
+
+        with patch.dict(sys.modules, {"torchcomms": mock_torchcomms}):
+            bootstrap = TorchcommsBootstrap(
+                store=MagicMock(name="store"), pg_free=True,
+            )
+            info = bootstrap.create_group(
+                group_ranks=[[0, 1]],
+                global_rank=0,
+                backend="nccl",
+            )
+
+        # ProcessGroupBootstrap.create_group must NOT be called.
+        mock_pg_create.assert_not_called()
+        # PGs should be None.
+        self.assertIsNone(info.cpu_group)
+        self.assertIsNone(info.device_group)
+        # TorchComm objects should be present.
+        self.assertIs(info.device_comm, mock_sub_comm)
+        self.assertIs(info.cpu_comm, mock_sub_comm)
+        # Metadata should be computed correctly.
+        self.assertEqual(info.rank, 0)
+        self.assertEqual(info.ranks, [0, 1])
+        self.assertEqual(info.world_size, 2)
+        self.assertEqual(info.rank_in_group, 0)
+        # torchcomms.new_comm should still be called (world comms).
+        self.assertEqual(mock_torchcomms.new_comm.call_count, 2)
+
+    @patch.dict("os.environ", ENV_VARS)
+    @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
+    @patch.object(ProcessGroupBootstrap, "create_group")
+    def test_pg_free_multiple_groups(
+        self, mock_pg_create, mock_prefix_store
+    ):
+        """pg_free=True with multiple group_ranks selects correct group."""
+        mock_torchcomms, mock_world_comm, _ = self._make_mock_torchcomms()
+        device_sub = MagicMock(name="device_sub")
+        cpu_sub = MagicMock(name="cpu_sub")
+        mock_world_comm.split.side_effect = [device_sub, cpu_sub]
+
+        env = dict(self.ENV_VARS, RANK="3")
+        with patch.dict("os.environ", env), \
+             patch.dict(sys.modules, {"torchcomms": mock_torchcomms}):
+            bootstrap = TorchcommsBootstrap(
+                store=MagicMock(name="store"), pg_free=True,
+            )
+            info = bootstrap.create_group(
+                group_ranks=[[0, 1], [2, 3]],
+                global_rank=3,
+                backend="nccl",
+            )
+
+        mock_pg_create.assert_not_called()
+        self.assertEqual(info.rank, 3)
+        self.assertEqual(info.ranks, [2, 3])
+        self.assertEqual(info.world_size, 2)
+        self.assertEqual(info.rank_in_group, 1)
+        self.assertIsNone(info.cpu_group)
+        self.assertIsNone(info.device_group)
+        self.assertIs(info.device_comm, device_sub)
+        self.assertIs(info.cpu_comm, cpu_sub)
+
+    @patch.dict("os.environ", ENV_VARS)
+    @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
+    @patch.object(ProcessGroupBootstrap, "create_group")
+    def test_pg_free_rank_not_found_raises(
+        self, mock_pg_create, mock_prefix_store
+    ):
+        """pg_free=True raises AssertionError when rank not in any group."""
+        mock_torchcomms, _, _ = self._make_mock_torchcomms()
+
+        with patch.dict(sys.modules, {"torchcomms": mock_torchcomms}):
+            bootstrap = TorchcommsBootstrap(
+                store=MagicMock(name="store"), pg_free=True,
+            )
+            with self.assertRaises(AssertionError):
+                bootstrap.create_group(
+                    group_ranks=[[0, 1]],
+                    global_rank=5,
+                    backend="nccl",
+                )
+
+        mock_pg_create.assert_not_called()
+
+    @patch.dict("os.environ", ENV_VARS)
+    @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
+    @patch.object(ProcessGroupBootstrap, "create_group")
+    def test_pg_free_false_still_creates_pgs(
+        self, mock_pg_create, mock_prefix_store
+    ):
+        """Default pg_free=False still creates ProcessGroups (backward compat)."""
+        mock_torchcomms, _, mock_sub_comm = self._make_mock_torchcomms()
+        pg_info = BootstrapInfo(
+            rank=0,
+            ranks=[0, 1],
+            world_size=2,
+            rank_in_group=0,
+            cpu_group=MagicMock(name="cpu_pg"),
+            device_group=MagicMock(name="device_pg"),
+        )
+        mock_pg_create.return_value = pg_info
+        custom_store = MagicMock(name="custom_store")
+
+        with patch.dict(sys.modules, {"torchcomms": mock_torchcomms}):
+            bootstrap = TorchcommsBootstrap(
+                store=custom_store,
+            )  # pg_free defaults to False
+            info = bootstrap.create_group(
+                group_ranks=[[0, 1]],
+                global_rank=0,
+                backend="nccl",
+            )
+
+        mock_pg_create.assert_called_once()
+        self.assertIs(info.cpu_group, pg_info.cpu_group)
+        self.assertIs(info.device_group, pg_info.device_group)
+        self.assertIs(info.device_comm, mock_sub_comm)
+        self.assertIs(info.cpu_comm, mock_sub_comm)
+
+
 class TorchCommDeviceCommunicatorTest(unittest.TestCase):
     """Unit tests for TorchCommDeviceCommunicator with mocked TorchComm."""
 

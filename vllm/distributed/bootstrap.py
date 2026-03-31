@@ -140,11 +140,13 @@ class TorchcommsBootstrap(BootstrapProvider):
         device: torch.device | None = None,
         timeout: timedelta | None = None,
         group_name: str | None = None,
+        pg_free: bool = False,
     ) -> None:
         self._store = store
         self._device = device
         self._timeout = timeout or timedelta(seconds=300)
         self._group_name = group_name or "vllm"
+        self._pg_free = pg_free
         # Lazily-created world-level communicators.
         self._world_device_comm: Any | None = None
         self._world_cpu_comm: Any | None = None
@@ -154,10 +156,11 @@ class TorchcommsBootstrap(BootstrapProvider):
         self._pg_bootstrap = ProcessGroupBootstrap()
 
         logger.info("[torchcomms] TorchcommsBootstrap created: "
-                    "group_name=%s, timeout=%s, store=%s, device=%s",
+                    "group_name=%s, timeout=%s, store=%s, device=%s, "
+                    "pg_free=%s",
                     self._group_name, self._timeout,
                     type(store).__name__ if store else "None",
-                    device)
+                    device, pg_free)
 
     def _get_store(self) -> torch.distributed.Store:
         """Return the provided store or get it from the default process group.
@@ -285,21 +288,48 @@ class TorchcommsBootstrap(BootstrapProvider):
         backend: str,
     ) -> BootstrapInfo:
         logger.info("[torchcomms] create_group called: "
-                    "group_ranks=%s, global_rank=%d, backend=%s",
-                    group_ranks, global_rank, backend)
+                    "group_ranks=%s, global_rank=%d, backend=%s, "
+                    "pg_free=%s",
+                    group_ranks, global_rank, backend, self._pg_free)
 
-        # 1. Create ProcessGroups via the standard path.
-        logger.info("[torchcomms] Step 1/3: Creating ProcessGroups "
-                    "via standard torch.distributed path")
-        pg_info = self._pg_bootstrap.create_group(
-            group_ranks, global_rank, backend
-        )
-        logger.info("[torchcomms] ProcessGroups created: "
-                    "rank=%d, ranks=%s, world_size=%d, rank_in_group=%d, "
-                    "device_group=%s, cpu_group=%s",
-                    pg_info.rank, pg_info.ranks, pg_info.world_size,
-                    pg_info.rank_in_group, pg_info.device_group,
-                    pg_info.cpu_group)
+        # 1. Create ProcessGroups (unless pg_free mode).
+        if self._pg_free:
+            logger.info("[torchcomms] Step 1/3: Skipping ProcessGroup "
+                        "creation (pg_free=True)")
+            # Compute rank metadata locally instead of via PG bootstrap.
+            result_ranks: list[int] | None = None
+            for ranks in group_ranks:
+                if global_rank in ranks:
+                    result_ranks = ranks
+                    break
+            assert result_ranks is not None, (
+                f"global_rank {global_rank} not found in any group_ranks"
+            )
+            pg_rank = global_rank
+            pg_ranks = result_ranks
+            pg_world_size = len(result_ranks)
+            pg_rank_in_group = result_ranks.index(global_rank)
+            pg_cpu_group = None
+            pg_device_group = None
+        else:
+            logger.info("[torchcomms] Step 1/3: Creating ProcessGroups "
+                        "via standard torch.distributed path")
+            pg_info = self._pg_bootstrap.create_group(
+                group_ranks, global_rank, backend
+            )
+            logger.info("[torchcomms] ProcessGroups created: "
+                        "rank=%d, ranks=%s, world_size=%d, "
+                        "rank_in_group=%d, "
+                        "device_group=%s, cpu_group=%s",
+                        pg_info.rank, pg_info.ranks, pg_info.world_size,
+                        pg_info.rank_in_group, pg_info.device_group,
+                        pg_info.cpu_group)
+            pg_rank = pg_info.rank
+            pg_ranks = pg_info.ranks
+            pg_world_size = pg_info.world_size
+            pg_rank_in_group = pg_info.rank_in_group
+            pg_cpu_group = pg_info.cpu_group
+            pg_device_group = pg_info.device_group
 
         # 2. Create TorchComm communicators.
         logger.info("[torchcomms] Step 2/3: Ensuring world-level "
@@ -345,19 +375,19 @@ class TorchcommsBootstrap(BootstrapProvider):
                     "name=%s_cpu_split%d, comm=%s",
                     self._group_name, split_id, cpu_sub)
 
-        # 3. Return combined info: PGs + TorchComm objects.
+        # 3. Return combined info: PGs (if created) + TorchComm objects.
         logger.info("[torchcomms] create_group complete for "
                     "global_rank=%d: split_id=%d, "
-                    "world_size=%d, rank_in_group=%d",
+                    "world_size=%d, rank_in_group=%d, pg_free=%s",
                     global_rank, split_id,
-                    pg_info.world_size, pg_info.rank_in_group)
+                    pg_world_size, pg_rank_in_group, self._pg_free)
         return BootstrapInfo(
-            rank=pg_info.rank,
-            ranks=pg_info.ranks,
-            world_size=pg_info.world_size,
-            rank_in_group=pg_info.rank_in_group,
-            cpu_group=pg_info.cpu_group,
-            device_group=pg_info.device_group,
+            rank=pg_rank,
+            ranks=pg_ranks,
+            world_size=pg_world_size,
+            rank_in_group=pg_rank_in_group,
+            cpu_group=pg_cpu_group,
+            device_group=pg_device_group,
             device_comm=device_sub,
             cpu_comm=cpu_sub,
         )

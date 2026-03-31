@@ -123,7 +123,7 @@ class DeviceCommunicatorBase:
 
     def __init__(
         self,
-        cpu_group: ProcessGroup,
+        cpu_group: ProcessGroup | None = None,
         device: torch.device | None = None,
         device_group: ProcessGroup | None = None,
         unique_name: str = "",
@@ -135,28 +135,49 @@ class DeviceCommunicatorBase:
         self.device_group = device_group
         self.unique_name = unique_name
 
-        # Check if this is a stateless process group
-        from torch.distributed.distributed_c10d import _world
-
-        is_stateless = _world.pg_map.get(cpu_group, None) is None
-
-        if is_stateless:
-            # For stateless groups, we can't use torch.distributed methods
-            self.rank = cpu_group.rank()
-            self.world_size = cpu_group.size()
-            assert global_ranks is not None
-            assert global_world_size is not None
-            self.ranks = global_ranks
-            self.global_rank = self.ranks[self.rank]
-            self.global_world_size = global_world_size
-            self.rank_in_group = self.rank
+        if cpu_group is None:
+            # When no ProcessGroup is provided (e.g. torchcomms-only mode),
+            # rank metadata must be supplied via global_ranks / global_world_size
+            # or set by the subclass after calling super().__init__().
+            if global_ranks is not None and global_world_size is not None:
+                self.rank = global_ranks[0] if len(global_ranks) == 1 else 0
+                self.world_size = len(global_ranks)
+                self.ranks = global_ranks
+                self.global_rank = global_ranks[0] if global_ranks else 0
+                self.global_world_size = global_world_size
+                self.rank_in_group = 0
+            else:
+                # Subclass is responsible for setting these attributes.
+                self.rank = 0
+                self.world_size = 1
+                self.ranks = [0]
+                self.global_rank = 0
+                self.global_world_size = 1
+                self.rank_in_group = 0
         else:
-            self.rank = dist.get_rank(cpu_group)
-            self.world_size = dist.get_world_size(cpu_group)
-            self.ranks = dist.get_process_group_ranks(cpu_group)
-            self.global_rank = dist.get_rank()
-            self.global_world_size = dist.get_world_size()
-            self.rank_in_group = dist.get_group_rank(self.cpu_group, self.global_rank)
+            # Check if this is a stateless process group
+            from torch.distributed.distributed_c10d import _world
+
+            is_stateless = _world.pg_map.get(cpu_group, None) is None
+
+            if is_stateless:
+                # For stateless groups, we can't use torch.distributed methods
+                self.rank = cpu_group.rank()
+                self.world_size = cpu_group.size()
+                assert global_ranks is not None
+                assert global_world_size is not None
+                self.ranks = global_ranks
+                self.global_rank = self.ranks[self.rank]
+                self.global_world_size = global_world_size
+                self.rank_in_group = self.rank
+            else:
+                self.rank = dist.get_rank(cpu_group)
+                self.world_size = dist.get_world_size(cpu_group)
+                self.ranks = dist.get_process_group_ranks(cpu_group)
+                self.global_rank = dist.get_rank()
+                self.global_world_size = dist.get_world_size()
+                self.rank_in_group = dist.get_group_rank(
+                    self.cpu_group, self.global_rank)
 
         use_ep = False
         all2all_backend = None
@@ -175,8 +196,20 @@ class DeviceCommunicatorBase:
         self.all2all_backend = all2all_backend
         self.all2all_manager: All2AllManagerBase | None = None
 
+    def _require_device_group(self, op_name: str) -> ProcessGroup:
+        """Return the device_group or raise if it's not available."""
+        if self.device_group is None:
+            raise RuntimeError(
+                f"{type(self).__name__}.{op_name}() requires a device "
+                "ProcessGroup, but none was provided. Either pass a "
+                "device_group at construction time or use a subclass that "
+                "overrides this method (e.g. TorchCommDeviceCommunicator)."
+            )
+        return self.device_group
+
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        dist.all_reduce(input_, group=self.device_group)
+        group = self._require_device_group("all_reduce")
+        dist.all_reduce(input_, group=group)
         return input_
 
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -193,7 +226,8 @@ class DeviceCommunicatorBase:
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
-        dist.all_gather_into_tensor(output_tensor, input_, group=self.device_group)
+        group = self._require_device_group("all_gather")
+        dist.all_gather_into_tensor(output_tensor, input_, group=group)
         # Reshape
         output_tensor = output_tensor.reshape((self.world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -238,8 +272,9 @@ class DeviceCommunicatorBase:
         )
 
         # Perform reduce-scatter operation
+        group = self._require_device_group("reduce_scatter")
         torch.distributed.reduce_scatter_tensor(
-            output_tensor, input_tensor, group=self.device_group
+            output_tensor, input_tensor, group=group
         )
 
         # Reshape before returning
@@ -272,8 +307,9 @@ class DeviceCommunicatorBase:
         else:
             gather_list = None
         # Gather.
+        group = self._require_device_group("gather")
         torch.distributed.gather(
-            input_, gather_list, dst=self.ranks[dst], group=self.device_group
+            input_, gather_list, dst=self.ranks[dst], group=group
         )
         if self.rank_in_group == dst:
             output_tensor = torch.cat(gather_list, dim=dim)
@@ -286,7 +322,8 @@ class DeviceCommunicatorBase:
         """NOTE: `dst` is the local rank of the destination rank."""
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
-        torch.distributed.send(tensor, self.ranks[dst], self.device_group)
+        group = self._require_device_group("send")
+        torch.distributed.send(tensor, self.ranks[dst], group)
 
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: int | None = None
@@ -297,14 +334,16 @@ class DeviceCommunicatorBase:
             src = (self.rank_in_group - 1) % self.world_size
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        torch.distributed.recv(tensor, self.ranks[src], self.device_group)
+        group = self._require_device_group("recv")
+        torch.distributed.recv(tensor, self.ranks[src], group)
         return tensor
 
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         """Broadcast a tensor from source rank to all ranks."""
         if self.world_size == 1:
             return tensor
-        torch.distributed.broadcast(tensor, self.ranks[src], self.device_group)
+        group = self._require_device_group("broadcast")
+        torch.distributed.broadcast(tensor, self.ranks[src], group)
         return tensor
 
     def destroy(self):

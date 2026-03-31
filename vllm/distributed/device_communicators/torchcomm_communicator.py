@@ -25,7 +25,7 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
 
     def __init__(
         self,
-        cpu_group: ProcessGroup,
+        cpu_group: ProcessGroup | None = None,
         device: torch.device | None = None,
         device_group: ProcessGroup | None = None,
         device_comm: Any = None,
