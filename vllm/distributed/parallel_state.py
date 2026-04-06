@@ -343,9 +343,9 @@ class GroupCoordinator:
                      group_name, type(bootstrap_provider).__name__,
                      group_ranks, torch_distributed_backend)
 
-        info = bootstrap_provider.create_group(
+        info = bootstrap_provider.get_bootstrap_info(
             group_ranks,
-            torch.distributed.get_rank(),
+            _get_bootstrap().get_rank(),
             str(torch_distributed_backend),
         )
         self.rank = info.rank
@@ -424,9 +424,14 @@ class GroupCoordinator:
 
         self.mq_broadcaster: MessageQueue | None = None
         if use_message_queue_broadcaster and self.world_size > 1:
-            self.mq_broadcaster = MessageQueue.create_from_process_group(
-                self.cpu_group, 1 << 22, 6
-            )
+            # Prefer cpu_comm (TorchComm) when available for PG-free setup,
+            # fall back to cpu_group (ProcessGroup).
+            mq_coord = self.cpu_comm if self.cpu_comm is not None \
+                else self.cpu_group
+            if mq_coord is not None:
+                self.mq_broadcaster = MessageQueue.create_from_process_group(
+                    mq_coord, 1 << 22, 6
+                )
 
         # TODO(#35915): Remove is_tpu() check once tpu_inference
         # overrides use_custom_op_collectives() to return True.
@@ -805,7 +810,7 @@ class GroupCoordinator:
         NOTE: `src` is the local rank of the source rank.
         """
         # Bypass the function if we are using only 1 GPU.
-        if not torch.distributed.is_initialized() or self.world_size == 1:
+        if not _get_bootstrap().is_initialized() or self.world_size == 1:
             return tensor_dict
 
         group = self.device_group
@@ -935,7 +940,7 @@ class GroupCoordinator:
             basis.
         """
         # Bypass the function if we are using only 1 GPU.
-        if not torch.distributed.is_initialized() or self.world_size == 1:
+        if not _get_bootstrap().is_initialized() or self.world_size == 1:
             return tensor_dict
         handles = self.isend_tensor_dict(
             tensor_dict,
@@ -1039,7 +1044,7 @@ class GroupCoordinator:
             basis.
         """
         # Bypass the function if we are using only 1 GPU.
-        if not torch.distributed.is_initialized() or self.world_size == 1:
+        if not _get_bootstrap().is_initialized() or self.world_size == 1:
             return None
         tensor_dict, handles, postprocess = self.irecv_tensor_dict(
             src=src,
@@ -1062,7 +1067,7 @@ class GroupCoordinator:
         list[Handle],
         list[Callable[[], None]],
     ]:
-        if not torch.distributed.is_initialized() or self.world_size == 1:
+        if not _get_bootstrap().is_initialized() or self.world_size == 1:
             return None, [], []
 
         if src is None:
@@ -1448,6 +1453,11 @@ _ENABLE_CUSTOM_ALL_REDUCE = True
 _DEFAULT_BOOTSTRAP_PROVIDER: BootstrapProvider | None = None
 
 
+def _get_bootstrap() -> BootstrapProvider:
+    """Return the current bootstrap provider, falling back to ProcessGroup."""
+    return _DEFAULT_BOOTSTRAP_PROVIDER or ProcessGroupBootstrap()
+
+
 def set_custom_all_reduce(enable: bool):
     global _ENABLE_CUSTOM_ALL_REDUCE
     _ENABLE_CUSTOM_ALL_REDUCE = enable
@@ -1547,7 +1557,8 @@ def init_distributed_environment(
                 rank,
                 distributed_init_method,
             )
-    if not torch.distributed.is_initialized():
+    bootstrap = _get_bootstrap()
+    if not bootstrap.is_initialized():
         logger.info(
             "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s",
             world_size,
@@ -1570,11 +1581,11 @@ def init_distributed_environment(
             )
             backend = "gloo"
         # this backend is used for WORLD
-        torch.distributed.init_process_group(
+        bootstrap.init(
+            rank=rank,
+            world_size=world_size,
             backend=backend,
             init_method=distributed_init_method,
-            world_size=world_size,
-            rank=rank,
             timeout=timeout,
         )
         if enable_elastic_ep:
@@ -1602,15 +1613,18 @@ def init_distributed_environment(
         _init_elastic_ep_world(config, local_rank, backend, rank, world_size)
         return
     if _WORLD is None:
-        ranks = list(range(torch.distributed.get_world_size()))
+        ranks = list(range(bootstrap.get_world_size()))
         _WORLD = init_world_group(ranks, local_rank, backend)
         if config is not None and config.parallel_config.nnodes > 1:
             _NODE_COUNT = config.parallel_config.nnodes
         else:
-            _NODE_COUNT = _node_count(_WORLD.cpu_group)
+            # Prefer cpu_comm (TorchComm) when PG is not available.
+            _nc_pg = _WORLD.cpu_comm if _WORLD.cpu_group is None \
+                else _WORLD.cpu_group
+            _NODE_COUNT = _node_count(_nc_pg)
         logger.debug("Detected %d nodes in the distributed environment", _NODE_COUNT)
     else:
-        assert _WORLD.world_size == torch.distributed.get_world_size(), (
+        assert _WORLD.world_size == bootstrap.get_world_size(), (
             "world group already initialized with a different world size"
         )
     if config is not None and config.parallel_config.nnodes_within_dp > 1:
@@ -1663,7 +1677,7 @@ def initialize_model_parallel(
     ranks 8 to 15 belong to the second box.
     """
     # Get world size and rank. Ensure some consistencies.
-    assert torch.distributed.is_initialized()
+    assert _get_bootstrap().is_initialized()
 
     from vllm.config import get_current_vllm_config
 
@@ -1692,11 +1706,9 @@ def initialize_model_parallel(
             tensor_model_parallel_size,
         )
     else:
-        world_size = torch.distributed.get_world_size()
-        rank = torch.distributed.get_rank()
-        backend = backend or torch.distributed.get_backend(
-            get_world_group().device_group
-        )
+        world_size = _get_bootstrap().get_world_size()
+        rank = _get_bootstrap().get_rank()
+        backend = backend or _get_bootstrap().get_backend()
 
     # the layout order is: ExternalDP x DP x PP x TP
     # ExternalDP is the data parallel group that is not part of the model,
@@ -1891,7 +1903,7 @@ def ensure_model_parallel_initialized(
     if hasattr(world_group, "backend"):
         backend = backend or world_group.backend
     else:
-        backend = backend or torch.distributed.get_backend(world_group.device_group)
+        backend = backend or _get_bootstrap().get_backend()
     if not model_parallel_is_initialized():
         initialize_model_parallel(
             tensor_model_parallel_size,
@@ -2046,8 +2058,7 @@ def destroy_distributed_environment():
         _WORLD.destroy()
     _WORLD = None
     _NODE_COUNT = None
-    if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
+    _get_bootstrap().destroy()
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
@@ -2086,28 +2097,74 @@ def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
             )
 
 
+def _is_torchcomm(obj: Any) -> bool:
+    """Check if obj is a TorchComm communicator (without importing torchcomms)."""
+    return type(obj).__name__ == "TorchComm"
+
+
 def in_the_same_node_as(
-    pg: ProcessGroup | StatelessProcessGroup, source_rank: int = 0
+    pg: "ProcessGroup | StatelessProcessGroup | Any",
+    source_rank: int = 0,
 ) -> list[bool]:
     """
     This is a collective operation that returns if each rank is in the same node
     as the source rank. It tests if processes are attached to the same
     memory system (shared access to shared memory).
+
+    Accepts a ProcessGroup, StatelessProcessGroup, or TorchComm communicator.
     """
-    if isinstance(pg, ProcessGroup):
+    if _is_torchcomm(pg):
+        from torchcomms import objcol
+        rank = pg.get_rank()
+        world_size = pg.get_size()
+        ranks = list(range(world_size))
+
+        def _broadcast_obj(obj, src):
+            obj_list = [obj]
+            objcol.broadcast_object_list(pg, obj_list, root=src,
+                                         weights_only=False)
+            return obj_list[0]
+
+        def _barrier():
+            pg.barrier(async_op=False)
+
+        def _all_reduce(tensor):
+            import torchcomms
+            pg.all_reduce(tensor, op=torchcomms.ReduceOp.SUM,
+                          async_op=False)
+    elif isinstance(pg, ProcessGroup):
         assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
             "in_the_same_node_as should be tested with a non-NCCL group."
         )
-        # local rank inside the group
         rank = torch.distributed.get_rank(group=pg)
         world_size = torch.distributed.get_world_size(group=pg)
-
-        # global ranks of the processes in the group
         ranks = torch.distributed.get_process_group_ranks(pg)
+
+        def _broadcast_obj(obj, src):
+            obj_list = [obj]
+            torch.distributed.broadcast_object_list(
+                obj_list, src=ranks[src], group=pg
+            )
+            return obj_list[0]
+
+        def _barrier():
+            torch.distributed.barrier(group=pg)
+
+        def _all_reduce(tensor):
+            torch.distributed.all_reduce(tensor, group=pg)
     else:
+        # StatelessProcessGroup
         rank = pg.rank
         world_size = pg.world_size
         ranks = list(range(world_size))
+
+        def _broadcast_obj(obj, src):
+            return pg.broadcast_obj(obj, src=src)
+
+        def _barrier():
+            pg.barrier()
+
+        _all_reduce = None  # handled via broadcast below
 
     # local tensor in each process to store the result
     is_in_the_same_node = torch.tensor(
@@ -2120,30 +2177,13 @@ def in_the_same_node_as(
     try:
         with contextlib.suppress(OSError):
             if rank == source_rank:
-                # create a shared memory segment
                 shm = shared_memory.SharedMemory(create=True, size=128)
                 assert shm.buf is not None, "Buffer was not created"
                 shm.buf[: len(magic_message)] = magic_message
-                if isinstance(pg, ProcessGroup):
-                    torch.distributed.broadcast_object_list(
-                        [shm.name], src=ranks[source_rank], group=pg
-                    )
-                else:
-                    pg.broadcast_obj(shm.name, src=source_rank)
+                _broadcast_obj(shm.name, source_rank)
                 is_in_the_same_node[rank] = 1
             else:
-                # try to open the shared memory segment
-                if isinstance(pg, ProcessGroup):
-                    recv = [None]
-                    torch.distributed.broadcast_object_list(
-                        recv, src=ranks[source_rank], group=pg
-                    )
-                    name = recv[0]
-                else:
-                    name = pg.broadcast_obj(None, src=source_rank)
-                # fix to https://stackoverflow.com/q/62748654/9191338
-                # Python incorrectly tracks shared memory even if it is not
-                # created by the process. The following patch is a workaround.
+                name = _broadcast_obj(None, source_rank)
                 with patch(
                     "multiprocessing.resource_tracker.register",
                     lambda *args, **kwargs: None,
@@ -2158,23 +2198,21 @@ def in_the_same_node_as(
         if shm:
             shm.close()
 
-    if isinstance(pg, ProcessGroup):
-        torch.distributed.barrier(group=pg)
-    else:
-        pg.barrier()
+    _barrier()
 
     # clean up the shared memory segment
     with contextlib.suppress(OSError):
         if rank == source_rank and shm:
             shm.unlink()
 
-    if isinstance(pg, ProcessGroup):
-        torch.distributed.all_reduce(is_in_the_same_node, group=pg)
+    if _all_reduce is not None:
+        _all_reduce(is_in_the_same_node)
         aggregated_data = is_in_the_same_node
     else:
+        # StatelessProcessGroup: no all_reduce, use broadcast-and-sum
         aggregated_data = torch.zeros_like(is_in_the_same_node)
         for i in range(world_size):
-            rank_data = pg.broadcast_obj(is_in_the_same_node, src=i)
+            rank_data = _broadcast_obj(is_in_the_same_node, src=i)
             aggregated_data += rank_data
 
     return [x == 1 for x in aggregated_data.tolist()]
@@ -2199,12 +2237,12 @@ def is_global_first_rank() -> bool:
         if _WORLD is not None:
             return _WORLD.is_first_rank
 
-        # If torch distributed is not initialized, assume single process
-        if not torch.distributed.is_initialized():
+        # If distributed is not initialized, assume single process
+        if not _get_bootstrap().is_initialized():
             return True
 
-        # Fallback to torch's global rank
-        return torch.distributed.get_rank() == 0
+        # Fallback to bootstrap's global rank
+        return _get_bootstrap().get_rank() == 0
 
     except Exception:
         # If anything goes wrong, assume this is the first rank
@@ -2221,7 +2259,7 @@ def is_local_first_rank() -> bool:
         if _WORLD is not None:
             return _WORLD.local_rank == 0
 
-        if not torch.distributed.is_initialized():
+        if not _get_bootstrap().is_initialized():
             return True
 
         # fallback to environment-provided local rank if available
@@ -2229,22 +2267,24 @@ def is_local_first_rank() -> bool:
         try:
             return int(envs.LOCAL_RANK) == 0  # type: ignore[arg-type]
         except Exception:
-            return torch.distributed.get_rank() == 0
+            return _get_bootstrap().get_rank() == 0
     except Exception:
         return True
 
 
-def _node_count(pg: ProcessGroup | StatelessProcessGroup) -> int:
+def _node_count(pg) -> int:
     """
     Returns the total number of nodes in the process group.
 
     Args:
-        pg: The process group to analyze
+        pg: ProcessGroup, StatelessProcessGroup, or TorchComm communicator.
 
     Returns:
         int: The total number of nodes
     """
-    if isinstance(pg, ProcessGroup):
+    if _is_torchcomm(pg):
+        world_size = pg.get_size()
+    elif isinstance(pg, ProcessGroup):
         world_size = torch.distributed.get_world_size(group=pg)
     else:
         world_size = pg.world_size

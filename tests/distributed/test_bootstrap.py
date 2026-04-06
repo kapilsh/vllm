@@ -7,6 +7,7 @@ Run `pytest tests/distributed/test_bootstrap.py`.
 
 import sys
 import unittest
+from datetime import timedelta
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -65,7 +66,7 @@ class ProcessGroupBootstrapTest(unittest.TestCase):
         mock_new_group.side_effect = [device_pg, cpu_pg]
 
         bootstrap = ProcessGroupBootstrap()
-        info = bootstrap.create_group(
+        info = bootstrap.get_bootstrap_info(
             group_ranks=[[0, 1]],
             global_rank=0,
             backend="nccl",
@@ -98,7 +99,7 @@ class ProcessGroupBootstrapTest(unittest.TestCase):
         ]
 
         bootstrap = ProcessGroupBootstrap()
-        info = bootstrap.create_group(
+        info = bootstrap.get_bootstrap_info(
             group_ranks=[[0, 1], [2, 3]],
             global_rank=3,
             backend="nccl",
@@ -121,11 +122,72 @@ class ProcessGroupBootstrapTest(unittest.TestCase):
 
         bootstrap = ProcessGroupBootstrap()
         with self.assertRaises(AssertionError):
-            bootstrap.create_group(
+            bootstrap.get_bootstrap_info(
                 group_ranks=[[0, 1]],
                 global_rank=5,
                 backend="nccl",
             )
+
+
+class ProcessGroupBootstrapInitTest(unittest.TestCase):
+    """Tests for ProcessGroupBootstrap init/is_initialized/destroy methods."""
+
+    @patch("vllm.distributed.bootstrap.torch.distributed.init_process_group")
+    def test_init_delegates_to_torch(self, mock_init):
+        bootstrap = ProcessGroupBootstrap()
+        timeout = timedelta(seconds=60)
+        bootstrap.init(
+            rank=0, world_size=2, backend="nccl",
+            init_method="tcp://127.0.0.1:29500", timeout=timeout,
+        )
+        mock_init.assert_called_once_with(
+            backend="nccl",
+            world_size=2,
+            rank=0,
+            init_method="tcp://127.0.0.1:29500",
+            timeout=timeout,
+        )
+
+    @patch("vllm.distributed.bootstrap.torch.distributed.is_initialized")
+    def test_is_initialized_delegates(self, mock_is_init):
+        mock_is_init.return_value = True
+        bootstrap = ProcessGroupBootstrap()
+        self.assertTrue(bootstrap.is_initialized())
+        mock_is_init.assert_called_once()
+
+    @patch("vllm.distributed.bootstrap.torch.distributed.get_rank")
+    def test_get_rank_delegates(self, mock_get_rank):
+        mock_get_rank.return_value = 3
+        bootstrap = ProcessGroupBootstrap()
+        self.assertEqual(bootstrap.get_rank(), 3)
+
+    @patch("vllm.distributed.bootstrap.torch.distributed.get_world_size")
+    def test_get_world_size_delegates(self, mock_get_ws):
+        mock_get_ws.return_value = 8
+        bootstrap = ProcessGroupBootstrap()
+        self.assertEqual(bootstrap.get_world_size(), 8)
+
+    @patch("vllm.distributed.bootstrap.torch.distributed.get_backend")
+    def test_get_backend_delegates(self, mock_get_backend):
+        mock_get_backend.return_value = "nccl"
+        bootstrap = ProcessGroupBootstrap()
+        self.assertEqual(bootstrap.get_backend(), "nccl")
+
+    @patch("vllm.distributed.bootstrap.torch.distributed.destroy_process_group")
+    @patch("vllm.distributed.bootstrap.torch.distributed.is_initialized")
+    def test_destroy_delegates(self, mock_is_init, mock_destroy):
+        mock_is_init.return_value = True
+        bootstrap = ProcessGroupBootstrap()
+        bootstrap.destroy()
+        mock_destroy.assert_called_once()
+
+    @patch("vllm.distributed.bootstrap.torch.distributed.destroy_process_group")
+    @patch("vllm.distributed.bootstrap.torch.distributed.is_initialized")
+    def test_destroy_noop_when_not_initialized(self, mock_is_init, mock_destroy):
+        mock_is_init.return_value = False
+        bootstrap = ProcessGroupBootstrap()
+        bootstrap.destroy()
+        mock_destroy.assert_not_called()
 
 
 class BootstrapInfoOptionalFieldsTest(unittest.TestCase):
@@ -158,6 +220,63 @@ class BootstrapInfoOptionalFieldsTest(unittest.TestCase):
         self.assertIs(info.cpu_comm, cpu_comm)
         self.assertIsNone(info.cpu_group)
         self.assertIsNone(info.device_group)
+
+
+class TorchcommsBootstrapInitTest(unittest.TestCase):
+    """Tests for TorchcommsBootstrap init/is_initialized/destroy methods."""
+
+    ENV_VARS = {
+        "RANK": "0",
+        "WORLD_SIZE": "4",
+        "LOCAL_RANK": "0",
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": "29500",
+    }
+
+    def test_not_initialized_by_default(self):
+        bootstrap = TorchcommsBootstrap()
+        self.assertFalse(bootstrap.is_initialized())
+        self.assertEqual(bootstrap.get_rank(), -1)
+        self.assertEqual(bootstrap.get_world_size(), -1)
+
+    @patch.dict("os.environ", ENV_VARS)
+    def test_init_stores_state(self):
+        bootstrap = TorchcommsBootstrap()
+        bootstrap.init(rank=2, world_size=4, backend="nccl")
+        self.assertTrue(bootstrap.is_initialized())
+        self.assertEqual(bootstrap.get_rank(), 2)
+        self.assertEqual(bootstrap.get_world_size(), 4)
+        self.assertEqual(bootstrap.get_backend(), "nccl")
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_init_populates_env_vars(self):
+        """init() should set RANK, WORLD_SIZE env vars if not present."""
+        bootstrap = TorchcommsBootstrap()
+        # Mock cuda to avoid device errors in test env
+        with patch("torch.cuda.is_available", return_value=False):
+            bootstrap.init(rank=1, world_size=4, backend="nccl",
+                           init_method="tcp://10.0.0.1:12345")
+        import os
+        self.assertEqual(os.environ["RANK"], "1")
+        self.assertEqual(os.environ["WORLD_SIZE"], "4")
+        self.assertEqual(os.environ["MASTER_ADDR"], "10.0.0.1")
+        self.assertEqual(os.environ["MASTER_PORT"], "12345")
+
+    @patch.dict("os.environ", ENV_VARS)
+    @patch("vllm.distributed.bootstrap.torch.distributed.init_process_group")
+    def test_init_does_not_call_torch_init(self, mock_torch_init):
+        """TorchcommsBootstrap.init() must NOT call init_process_group."""
+        bootstrap = TorchcommsBootstrap()
+        bootstrap.init(rank=0, world_size=4, backend="nccl")
+        mock_torch_init.assert_not_called()
+
+    @patch.dict("os.environ", ENV_VARS)
+    def test_destroy_resets_state(self):
+        bootstrap = TorchcommsBootstrap()
+        bootstrap.init(rank=0, world_size=4, backend="nccl")
+        self.assertTrue(bootstrap.is_initialized())
+        bootstrap.destroy()
+        self.assertFalse(bootstrap.is_initialized())
 
 
 class TorchcommsBootstrapTest(unittest.TestCase):
@@ -197,7 +316,7 @@ class TorchcommsBootstrapTest(unittest.TestCase):
     @patch.dict("os.environ", ENV_VARS)
     @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
     @patch("vllm.distributed.bootstrap.torch.distributed.TCPStore")
-    @patch.object(ProcessGroupBootstrap, "create_group")
+    @patch.object(ProcessGroupBootstrap, "get_bootstrap_info")
     def test_single_group_creates_pgs_and_comms(
         self, mock_pg_create, mock_tcp_store, mock_prefix_store
     ):
@@ -210,15 +329,15 @@ class TorchcommsBootstrapTest(unittest.TestCase):
 
         with patch.dict(sys.modules, {"torchcomms": mock_torchcomms}):
             bootstrap = TorchcommsBootstrap()
-            info = bootstrap.create_group(
+            info = bootstrap.get_bootstrap_info(
                 group_ranks=[[0, 1]],
                 global_rank=0,
                 backend="nccl",
             )
 
-        # ProcessGroups present.
-        self.assertIs(info.cpu_group, pg_info.cpu_group)
-        self.assertIs(info.device_group, pg_info.device_group)
+        # PGs should be None (TorchcommsBootstrap is PG-free).
+        self.assertIsNone(info.cpu_group)
+        self.assertIsNone(info.device_group)
         # TorchComm objects present.
         self.assertIs(info.device_comm, mock_sub_comm)
         self.assertIs(info.cpu_comm, mock_sub_comm)
@@ -231,7 +350,7 @@ class TorchcommsBootstrapTest(unittest.TestCase):
     @patch.dict("os.environ", ENV_VARS)
     @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
     @patch("vllm.distributed.bootstrap.torch.distributed.TCPStore")
-    @patch.object(ProcessGroupBootstrap, "create_group")
+    @patch.object(ProcessGroupBootstrap, "get_bootstrap_info")
     def test_multiple_groups_selects_correct(
         self, mock_pg_create, mock_tcp_store, mock_prefix_store
     ):
@@ -247,7 +366,7 @@ class TorchcommsBootstrapTest(unittest.TestCase):
         with patch.dict("os.environ", env), \
              patch.dict(sys.modules, {"torchcomms": mock_torchcomms}):
             bootstrap = TorchcommsBootstrap()
-            info = bootstrap.create_group(
+            info = bootstrap.get_bootstrap_info(
                 group_ranks=[[0, 1], [2, 3]],
                 global_rank=3,
                 backend="nccl",
@@ -259,13 +378,13 @@ class TorchcommsBootstrapTest(unittest.TestCase):
         self.assertEqual(info.rank_in_group, 1)
         self.assertIs(info.device_comm, device_sub)
         self.assertIs(info.cpu_comm, cpu_sub)
-        self.assertIs(info.cpu_group, pg_info.cpu_group)
-        self.assertIs(info.device_group, pg_info.device_group)
+        self.assertIsNone(info.cpu_group)
+        self.assertIsNone(info.device_group)
 
     @patch.dict("os.environ", ENV_VARS)
     @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
     @patch("vllm.distributed.bootstrap.torch.distributed.TCPStore")
-    @patch.object(ProcessGroupBootstrap, "create_group")
+    @patch.object(ProcessGroupBootstrap, "get_bootstrap_info")
     def test_rank_not_found_raises(
         self, mock_pg_create, mock_tcp_store, mock_prefix_store
     ):
@@ -277,7 +396,7 @@ class TorchcommsBootstrapTest(unittest.TestCase):
         with patch.dict(sys.modules, {"torchcomms": mock_torchcomms}):
             bootstrap = TorchcommsBootstrap()
             with self.assertRaises(AssertionError):
-                bootstrap.create_group(
+                bootstrap.get_bootstrap_info(
                     group_ranks=[[0, 1]],
                     global_rank=5,
                     backend="nccl",
@@ -286,7 +405,7 @@ class TorchcommsBootstrapTest(unittest.TestCase):
     @patch.dict("os.environ", ENV_VARS)
     @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
     @patch("vllm.distributed.bootstrap.torch.distributed.TCPStore")
-    @patch.object(ProcessGroupBootstrap, "create_group")
+    @patch.object(ProcessGroupBootstrap, "get_bootstrap_info")
     def test_world_comms_created_only_once(
         self, mock_pg_create, mock_tcp_store, mock_prefix_store
     ):
@@ -298,7 +417,7 @@ class TorchcommsBootstrapTest(unittest.TestCase):
             mock_pg_create.return_value = self._make_pg_info(
                 0, [[0, 1, 2, 3]]
             )
-            bootstrap.create_group(
+            bootstrap.get_bootstrap_info(
                 group_ranks=[[0, 1, 2, 3]],
                 global_rank=0,
                 backend="nccl",
@@ -306,7 +425,7 @@ class TorchcommsBootstrapTest(unittest.TestCase):
             mock_pg_create.return_value = self._make_pg_info(
                 0, [[0, 1], [2, 3]]
             )
-            bootstrap.create_group(
+            bootstrap.get_bootstrap_info(
                 group_ranks=[[0, 1], [2, 3]],
                 global_rank=0,
                 backend="nccl",
@@ -318,7 +437,7 @@ class TorchcommsBootstrapTest(unittest.TestCase):
     @patch.dict("os.environ", ENV_VARS)
     @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
     @patch("vllm.distributed.bootstrap.torch.distributed.TCPStore")
-    @patch.object(ProcessGroupBootstrap, "create_group")
+    @patch.object(ProcessGroupBootstrap, "get_bootstrap_info")
     def test_store_from_env_vars(
         self, mock_pg_create, mock_tcp_store, mock_prefix_store
     ):
@@ -330,7 +449,7 @@ class TorchcommsBootstrapTest(unittest.TestCase):
 
         with patch.dict(sys.modules, {"torchcomms": mock_torchcomms}):
             bootstrap = TorchcommsBootstrap()
-            bootstrap.create_group(
+            bootstrap.get_bootstrap_info(
                 group_ranks=[[0, 1, 2, 3]],
                 global_rank=0,
                 backend="nccl",
@@ -345,7 +464,7 @@ class TorchcommsBootstrapTest(unittest.TestCase):
         )
 
     @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
-    @patch.object(ProcessGroupBootstrap, "create_group")
+    @patch.object(ProcessGroupBootstrap, "get_bootstrap_info")
     def test_provided_store_used(self, mock_pg_create, mock_prefix_store):
         mock_torchcomms, _, _ = self._make_mock_torchcomms()
         custom_store = MagicMock(name="custom_store")
@@ -357,7 +476,7 @@ class TorchcommsBootstrapTest(unittest.TestCase):
         with patch.dict("os.environ", env), \
              patch.dict(sys.modules, {"torchcomms": mock_torchcomms}):
             bootstrap = TorchcommsBootstrap(store=custom_store)
-            bootstrap.create_group(
+            bootstrap.get_bootstrap_info(
                 group_ranks=[[0, 1, 2, 3]],
                 global_rank=0,
                 backend="nccl",
@@ -368,8 +487,8 @@ class TorchcommsBootstrapTest(unittest.TestCase):
             self.assertIs(call[0][1], custom_store)
 
 
-class TorchcommsBootstrapPgFreeTest(unittest.TestCase):
-    """Tests for TorchcommsBootstrap with pg_free=True."""
+class TorchcommsBootstrapGroupCreationTest(unittest.TestCase):
+    """Tests for TorchcommsBootstrap (PG-free by default)."""
 
     ENV_VARS = {
         "RANK": "0",
@@ -390,27 +509,27 @@ class TorchcommsBootstrapPgFreeTest(unittest.TestCase):
 
     @patch.dict("os.environ", ENV_VARS)
     @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
-    @patch.object(ProcessGroupBootstrap, "create_group")
-    def test_pg_free_skips_process_groups(
+    @patch.object(ProcessGroupBootstrap, "get_bootstrap_info")
+    def test_no_process_groups_created(
         self, mock_pg_create, mock_prefix_store
     ):
-        """When pg_free=True, ProcessGroupBootstrap.create_group is NOT
-        called, but TorchComm communicators are still created."""
+        """TorchcommsBootstrap does NOT call ProcessGroupBootstrap.get_bootstrap_info,
+        but TorchComm communicators are still created."""
         mock_torchcomms, mock_world_comm, mock_sub_comm = (
             self._make_mock_torchcomms()
         )
 
         with patch.dict(sys.modules, {"torchcomms": mock_torchcomms}):
             bootstrap = TorchcommsBootstrap(
-                store=MagicMock(name="store"), pg_free=True,
+                store=MagicMock(name="store"),
             )
-            info = bootstrap.create_group(
+            info = bootstrap.get_bootstrap_info(
                 group_ranks=[[0, 1]],
                 global_rank=0,
                 backend="nccl",
             )
 
-        # ProcessGroupBootstrap.create_group must NOT be called.
+        # ProcessGroupBootstrap.get_bootstrap_info must NOT be called.
         mock_pg_create.assert_not_called()
         # PGs should be None.
         self.assertIsNone(info.cpu_group)
@@ -428,11 +547,11 @@ class TorchcommsBootstrapPgFreeTest(unittest.TestCase):
 
     @patch.dict("os.environ", ENV_VARS)
     @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
-    @patch.object(ProcessGroupBootstrap, "create_group")
-    def test_pg_free_multiple_groups(
+    @patch.object(ProcessGroupBootstrap, "get_bootstrap_info")
+    def test_multiple_groups_selects_correct(
         self, mock_pg_create, mock_prefix_store
     ):
-        """pg_free=True with multiple group_ranks selects correct group."""
+        """Multiple group_ranks selects correct group for this rank."""
         mock_torchcomms, mock_world_comm, _ = self._make_mock_torchcomms()
         device_sub = MagicMock(name="device_sub")
         cpu_sub = MagicMock(name="cpu_sub")
@@ -442,9 +561,9 @@ class TorchcommsBootstrapPgFreeTest(unittest.TestCase):
         with patch.dict("os.environ", env), \
              patch.dict(sys.modules, {"torchcomms": mock_torchcomms}):
             bootstrap = TorchcommsBootstrap(
-                store=MagicMock(name="store"), pg_free=True,
+                store=MagicMock(name="store"),
             )
-            info = bootstrap.create_group(
+            info = bootstrap.get_bootstrap_info(
                 group_ranks=[[0, 1], [2, 3]],
                 global_rank=3,
                 backend="nccl",
@@ -462,60 +581,25 @@ class TorchcommsBootstrapPgFreeTest(unittest.TestCase):
 
     @patch.dict("os.environ", ENV_VARS)
     @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
-    @patch.object(ProcessGroupBootstrap, "create_group")
-    def test_pg_free_rank_not_found_raises(
+    @patch.object(ProcessGroupBootstrap, "get_bootstrap_info")
+    def test_rank_not_found_raises(
         self, mock_pg_create, mock_prefix_store
     ):
-        """pg_free=True raises AssertionError when rank not in any group."""
+        """Raises AssertionError when rank not in any group."""
         mock_torchcomms, _, _ = self._make_mock_torchcomms()
 
         with patch.dict(sys.modules, {"torchcomms": mock_torchcomms}):
             bootstrap = TorchcommsBootstrap(
-                store=MagicMock(name="store"), pg_free=True,
+                store=MagicMock(name="store"),
             )
             with self.assertRaises(AssertionError):
-                bootstrap.create_group(
+                bootstrap.get_bootstrap_info(
                     group_ranks=[[0, 1]],
                     global_rank=5,
                     backend="nccl",
                 )
 
         mock_pg_create.assert_not_called()
-
-    @patch.dict("os.environ", ENV_VARS)
-    @patch("vllm.distributed.bootstrap.torch.distributed.PrefixStore")
-    @patch.object(ProcessGroupBootstrap, "create_group")
-    def test_pg_free_false_still_creates_pgs(
-        self, mock_pg_create, mock_prefix_store
-    ):
-        """Default pg_free=False still creates ProcessGroups (backward compat)."""
-        mock_torchcomms, _, mock_sub_comm = self._make_mock_torchcomms()
-        pg_info = BootstrapInfo(
-            rank=0,
-            ranks=[0, 1],
-            world_size=2,
-            rank_in_group=0,
-            cpu_group=MagicMock(name="cpu_pg"),
-            device_group=MagicMock(name="device_pg"),
-        )
-        mock_pg_create.return_value = pg_info
-        custom_store = MagicMock(name="custom_store")
-
-        with patch.dict(sys.modules, {"torchcomms": mock_torchcomms}):
-            bootstrap = TorchcommsBootstrap(
-                store=custom_store,
-            )  # pg_free defaults to False
-            info = bootstrap.create_group(
-                group_ranks=[[0, 1]],
-                global_rank=0,
-                backend="nccl",
-            )
-
-        mock_pg_create.assert_called_once()
-        self.assertIs(info.cpu_group, pg_info.cpu_group)
-        self.assertIs(info.device_group, pg_info.device_group)
-        self.assertIs(info.device_comm, mock_sub_comm)
-        self.assertIs(info.cpu_comm, mock_sub_comm)
 
 
 class TorchCommDeviceCommunicatorTest(unittest.TestCase):

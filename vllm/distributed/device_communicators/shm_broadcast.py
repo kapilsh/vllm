@@ -834,7 +834,7 @@ class MessageQueue:
 
     @staticmethod
     def create_from_process_group(
-        pg: ProcessGroup | StatelessProcessGroup,
+        pg,
         max_chunk_bytes,
         max_chunks,
         writer_rank: int = 0,
@@ -842,39 +842,56 @@ class MessageQueue:
         blocking: bool = True,
     ) -> "MessageQueue":
         """
-        Creates a MessageQueue for a distributed process group with one writer and
-        multiple readers.
-
-        This method is designed for scenarios where one process (the writer) sends
-        messages, and all other processes (the readers) receive messages. It sets up
-        the shared memory buffer and socket communication handles accordingly, and
-        broadcasts the handle from the writer to all readers.
+        Creates a MessageQueue for a distributed process group with one writer
+        and multiple readers.
 
         Args:
-            pg (ProcessGroup | StatelessProcessGroup): The torch distributed process
-                group.
-            max_chunk_bytes (int): Maximum size in bytes for each chunk in the buffer.
-            max_chunks (int): Maximum number of chunks in the buffer.
-            writer_rank (int, optional): The global rank that will act as the writer.
-                Defaults to 0.
-            external_writer_handle (Handle, optional): Used when there is a handle
-                from an external Message Queue. If provided, use this handle to init
-                PG writer message queue instead of creating a new one. Defaults to None.
-            blocking (bool, optional): If True, blocks until all processes are ready.
-                Defaults to True.
+            pg: ProcessGroup, StatelessProcessGroup, or TorchComm communicator.
+            max_chunk_bytes: Maximum size in bytes for each chunk in the buffer.
+            max_chunks: Maximum number of chunks in the buffer.
+            writer_rank: The group-local rank that will act as the writer.
+            external_writer_handle: External handle to reuse instead of creating
+                a new MessageQueue.
+            blocking: If True, blocks until all processes are ready.
 
         Returns:
             MessageQueue: The MessageQueue instance for the calling process.
-
         """
-        if isinstance(pg, ProcessGroup):
+        # Determine rank/world_size and define broadcast helper based on
+        # the coordination object type.
+        _is_tc = type(pg).__name__ == "TorchComm"
+        if _is_tc:
+            from torchcomms import objcol
+            group_rank = pg.get_rank()
+            group_world_size = pg.get_size()
+            global_ranks = list(range(group_world_size))
+
+            def _broadcast_obj(obj, src):
+                obj_list = [obj]
+                objcol.broadcast_object_list(
+                    pg, obj_list, root=src, weights_only=False
+                )
+                return obj_list[0]
+        elif isinstance(pg, ProcessGroup):
             group_rank = dist.get_rank(pg)
             group_world_size = dist.get_world_size(pg)
             global_ranks = dist.get_process_group_ranks(pg)
+
+            def _broadcast_obj(obj, src):
+                obj_list = [obj]
+                dist.broadcast_object_list(
+                    obj_list, src=global_ranks[src], group=pg
+                )
+                return obj_list[0]
         else:
+            # StatelessProcessGroup
             group_rank = pg.rank
             group_world_size = pg.world_size
             global_ranks = list(range(pg.world_size))
+
+            def _broadcast_obj(obj, src):
+                return pg.broadcast_obj(obj, src)
+
         from vllm.distributed.parallel_state import in_the_same_node_as
 
         status = in_the_same_node_as(pg, source_rank=writer_rank)
@@ -887,7 +904,9 @@ class MessageQueue:
                 same_node_ranks = [i for i, s in enumerate(status) if s]
                 n_reader = group_world_size - 1
                 n_local_reader = len(same_node_ranks) - 1
-                local_reader_ranks = [i for i in same_node_ranks if i != writer_rank]
+                local_reader_ranks = [
+                    i for i in same_node_ranks if i != writer_rank
+                ]
                 buffer_io = MessageQueue(
                     n_reader=n_reader,
                     n_local_reader=n_local_reader,
@@ -896,21 +915,9 @@ class MessageQueue:
                     max_chunks=max_chunks,
                 )
             handle = buffer_io.export_handle()
-            if isinstance(pg, ProcessGroup):
-                dist.broadcast_object_list(
-                    [handle], src=global_ranks[writer_rank], group=pg
-                )
-            else:
-                pg.broadcast_obj(handle, writer_rank)
+            _broadcast_obj(handle, writer_rank)
         else:
-            if isinstance(pg, ProcessGroup):
-                recv = [None]
-                dist.broadcast_object_list(
-                    recv, src=global_ranks[writer_rank], group=pg
-                )
-                handle = recv[0]  # type: ignore
-            else:
-                handle = pg.broadcast_obj(None, writer_rank)
+            handle = _broadcast_obj(None, writer_rank)
             buffer_io = MessageQueue.create_from_handle(handle, group_rank)
         if blocking:
             buffer_io.wait_until_ready()
