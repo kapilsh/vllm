@@ -644,7 +644,9 @@ class TorchCommDeviceCommunicatorTest(unittest.TestCase):
             tensor = torch.ones(4)
             result = communicator.all_reduce(tensor)
             mock_comm.all_reduce.assert_called_once()
-            self.assertIs(result, tensor)
+            # all_reduce is out-of-place: returns a new tensor
+            self.assertEqual(result.shape, tensor.shape)
+            self.assertIsNot(result, tensor)
 
     def test_broadcast(self):
         with patch.dict(sys.modules, {"torchcomms": self.MOCK_TORCHCOMMS}):

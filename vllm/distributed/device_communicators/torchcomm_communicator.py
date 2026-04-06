@@ -52,8 +52,14 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         import torchcomms
 
-        self.comm.all_reduce(input_, torchcomms.ReduceOp.SUM, async_op=False)
-        return input_
+        # Must be out-of-place: the vllm::all_reduce custom op's fake
+        # returns torch.empty_like(input_), so torch.compile assumes the
+        # output is a distinct tensor.  In-place would corrupt CUDA graph
+        # replay at TP>2.
+        out = torch.empty_like(input_)
+        out.copy_(input_)
+        self.comm.all_reduce(out, torchcomms.ReduceOp.SUM, async_op=False)
+        return out
 
     def all_gather(
         self, input_: torch.Tensor, dim: int = -1
