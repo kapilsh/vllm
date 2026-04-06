@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from __future__ import annotations
+
 import threading
+from typing import TYPE_CHECKING
 from weakref import WeakValueDictionary
 
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
+
+if TYPE_CHECKING:
+    from vllm.distributed.bootstrap import BootstrapInfo
 
 
 class Cache:
@@ -129,23 +135,45 @@ class DeviceCommunicatorBase:
         unique_name: str = "",
         global_ranks: list[int] | None = None,
         global_world_size: int | None = None,
+        bootstrap_info: BootstrapInfo | None = None,
     ):
         self.device = device or torch.device("cpu")
         self.cpu_group = cpu_group
         self.device_group = device_group
         self.unique_name = unique_name
 
-        if cpu_group is None:
+        if bootstrap_info is not None:
+            # Use BootstrapInfo as the single source of truth for rank
+            # metadata.  This is the preferred path for torchcomms-only
+            # mode where no ProcessGroup is available.
+            self.rank = bootstrap_info.rank_in_group
+            self.world_size = bootstrap_info.world_size
+            self.ranks = bootstrap_info.ranks
+            self.global_rank = bootstrap_info.rank
+            self.rank_in_group = bootstrap_info.rank_in_group
+            from vllm.distributed.parallel_state import _get_bootstrap
+            self.global_world_size = _get_bootstrap().get_world_size()
+            if bootstrap_info.cpu_group is not None:
+                self.cpu_group = bootstrap_info.cpu_group
+            if bootstrap_info.device_group is not None:
+                self.device_group = bootstrap_info.device_group
+        elif cpu_group is None:
             # When no ProcessGroup is provided (e.g. torchcomms-only mode),
             # rank metadata must be supplied via global_ranks / global_world_size
             # or set by the subclass after calling super().__init__().
             if global_ranks is not None and global_world_size is not None:
-                self.rank = global_ranks[0] if len(global_ranks) == 1 else 0
+                from vllm.distributed.parallel_state import _get_bootstrap
+                my_global_rank = _get_bootstrap().get_rank()
                 self.world_size = len(global_ranks)
                 self.ranks = global_ranks
-                self.global_rank = global_ranks[0] if global_ranks else 0
+                self.global_rank = my_global_rank
                 self.global_world_size = global_world_size
-                self.rank_in_group = 0
+                if my_global_rank in global_ranks:
+                    self.rank_in_group = global_ranks.index(my_global_rank)
+                    self.rank = self.rank_in_group
+                else:
+                    self.rank_in_group = 0
+                    self.rank = 0
             else:
                 # Subclass is responsible for setting these attributes.
                 self.rank = 0

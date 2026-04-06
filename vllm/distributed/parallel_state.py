@@ -388,17 +388,13 @@ class GroupCoordinator:
                 logger.info("GroupCoordinator[%s]: using "
                             "TorchCommDeviceCommunicator (torchcomms path)",
                             group_name)
-                torchcomm_kwargs: dict = dict(
+                self.device_communicator = TorchCommDeviceCommunicator(
+                    cpu_group=self.cpu_group,
                     device=self.device,
+                    device_group=self.device_group,
                     device_comm=self.device_comm,
                     unique_name=self.unique_name,
-                )
-                if self.cpu_group is not None:
-                    torchcomm_kwargs["cpu_group"] = self.cpu_group
-                if self.device_group is not None:
-                    torchcomm_kwargs["device_group"] = self.device_group
-                self.device_communicator = TorchCommDeviceCommunicator(
-                    **torchcomm_kwargs,
+                    bootstrap_info=info,
                 )
             else:
                 device_comm_cls = resolve_obj_by_qualname(

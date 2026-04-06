@@ -30,12 +30,14 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
         device_group: ProcessGroup | None = None,
         device_comm: Any = None,
         unique_name: str = "",
+        bootstrap_info: Any = None,
     ):
         super().__init__(
             cpu_group=cpu_group,
             device=device,
             device_group=device_group,
             unique_name=unique_name,
+            bootstrap_info=bootstrap_info,
         )
         assert device_comm is not None, (
             "TorchCommDeviceCommunicator requires a TorchComm object"
