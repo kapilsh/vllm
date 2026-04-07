@@ -167,6 +167,50 @@ class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
                 dst_tensor.copy_(cpu_tensor, non_blocking=True)
 
 
+class TorchCommEplbCommunicator(EplbCommunicator):
+    """EPLB communicator backed by a TorchComm object.
+
+    Uses ``batch_op_create()`` to collect send/recv ops, then issues
+    them all at once with ``issue()``.  This is the torchcomms equivalent
+    of ``torch.distributed.batch_isend_irecv``.
+
+    Note: Currently validated for EP groups of size 2 (the common case
+    for single-node TP+EP). Larger EP groups may require torchcomms
+    batch_op_create fixes for partial-participation P2P patterns.
+    """
+
+    def __init__(
+        self,
+        device_comm: object,
+        cuda_stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        self._comm = device_comm
+        self._cuda_stream = cuda_stream
+        self._batch = None
+        self._log_initialized()
+
+    def _ensure_batch(self) -> None:
+        if self._batch is None:
+            self._batch = self._comm.batch_op_create()
+
+    def add_send(self, tensor: torch.Tensor, dst_rank: int) -> None:
+        self._ensure_batch()
+        self._batch.send(tensor, dst_rank)
+
+    def add_recv(self, tensor: torch.Tensor, src_rank: int) -> None:
+        self._ensure_batch()
+        self._batch.recv(tensor, src_rank)
+
+    def execute(self) -> None:
+        if self._batch is None:
+            return
+        try:
+            with torch.cuda.stream(self._cuda_stream):
+                work = self._batch.issue(async_op=False)
+        finally:
+            self._batch = None
+
+
 class PyNcclEplbCommunicator(EplbCommunicator):
     """EPLB communicator backed by PyNcclCommunicator using ncclSend/ncclRecv."""
 
@@ -250,6 +294,20 @@ def create_eplb_communicator(
             raise RuntimeError(
                 f"Failed to initialize PyNcclEplbCommunicator ({exc})."
             ) from exc
+
+    # Auto-detect torchcomms: if the device communicator is a
+    # TorchCommDeviceCommunicator and no explicit backend was requested
+    # (or torch_nccl was requested), use TorchComm for EPLB.
+    device_comm = group_coordinator.device_communicator
+    from vllm.distributed.device_communicators.torchcomm_communicator import (
+        TorchCommDeviceCommunicator,
+    )
+    if isinstance(device_comm, TorchCommDeviceCommunicator) and backend in (
+        "torch_nccl", None
+    ):
+        return TorchCommEplbCommunicator(
+            device_comm=device_comm.comm,
+        )
 
     is_stateless = isinstance(group_coordinator, StatelessGroupCoordinator)
     if is_stateless:
