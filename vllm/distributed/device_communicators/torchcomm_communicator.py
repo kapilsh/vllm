@@ -194,6 +194,24 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
             return torch.cat(gather_list, dim=dim)
         return None
 
+    def batch_isend_irecv(self, p2p_ops: list) -> None:
+        """Batched P2P using torchcomms batch_op_create().
+
+        Accepts a list of ``torch.distributed.P2POp`` objects (same
+        interface as ``torch.distributed.batch_isend_irecv``) and
+        executes them via the TorchComm batch API.
+        """
+        batch = self.comm.batch_op_create()
+        for op in p2p_ops:
+            op_name = getattr(op.op, "__name__", "")
+            if op_name == "isend":
+                batch.send(op.tensor, op.group_peer)
+            elif op_name == "irecv":
+                batch.recv(op.tensor, op.group_peer)
+            else:
+                raise ValueError(f"Unsupported P2P op: {op.op}")
+        batch.issue(async_op=False)
+
     def destroy(self):
         if self.ca_comm is not None:
             self.ca_comm.close()

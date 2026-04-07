@@ -11,9 +11,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from torch.distributed import ProcessGroup, all_gather
 
-from .eplb_communicator import EplbCommunicator
+from .eplb_communicator import EplbCommunicator, EplbGroupContext
 
 
 @dataclass
@@ -403,7 +402,7 @@ async def transfer_layer(
     new_layer_indices: torch.Tensor,
     expert_weights: Sequence[torch.Tensor],
     expert_weights_buffer: Sequence[torch.Tensor],
-    ep_group: ProcessGroup,
+    ep_ctx: EplbGroupContext,
     communicator: EplbCommunicator,
     is_profile: bool = False,
     cuda_stream: torch.cuda.Stream | None = None,
@@ -422,7 +421,7 @@ async def transfer_layer(
             (num_local_physical_experts, hidden_size_i).
             For example, a linear layer may have up and down projection.
         expert_weights_buffer: Intermediate buffers (one per weight tensor).
-        ep_group: The device process group for expert parallelism.
+        ep_ctx: The EplbGroupContext for expert parallelism.
         communicator: EplbCommunicator instance for P2P communication.
         is_profile (bool): If `True`, do not perform any actual weight copy.
             This is used during profile run, where we only perform dummy
@@ -437,13 +436,13 @@ async def transfer_layer(
             can be received locally.
         RecvMetadata: Metadata needed for completing remote weight transfers.
     """
-    ep_size = ep_group.size()
+    ep_size = ep_ctx.size
     if rank_mapping is not None:
         # Add a layer dimension for compatibility with mapping functions
         old_layer_indices_2d = old_layer_indices.unsqueeze(0)
         new_layer_indices_2d = new_layer_indices.unsqueeze(0)
 
-        if len(rank_mapping) == ep_group.size():
+        if len(rank_mapping) == ep_ctx.size:
             # scale down
             new_layer_indices_2d = _map_new_expert_indices_with_rank_mapping(
                 new_layer_indices_2d,
@@ -454,7 +453,7 @@ async def transfer_layer(
             old_layer_indices_2d = _map_old_expert_indices_with_rank_mapping(
                 old_layer_indices_2d,
                 rank_mapping,
-                ep_group.size(),
+                ep_ctx.size,
             )
 
         # Remove the layer dimension
@@ -477,7 +476,7 @@ async def transfer_layer(
         expert_weights=expert_weights,
         expert_weights_buffers=expert_weights_buffer,
         cuda_stream=cuda_stream,
-        ep_rank=ep_group.rank(),
+        ep_rank=ep_ctx.rank,
         communicator=communicator,
     )
     return is_unchanged, is_received_locally, recv_metadata
@@ -487,7 +486,7 @@ def rearrange_expert_weights_inplace(
     old_global_expert_indices: torch.Tensor,
     new_global_expert_indices: torch.Tensor,
     expert_weights: Sequence[Sequence[torch.Tensor]],
-    ep_group: ProcessGroup,
+    ep_ctx: EplbGroupContext,
     communicator: EplbCommunicator,
     is_profile: bool = False,
     rank_mapping: dict[int, int] | None = None,
@@ -505,7 +504,7 @@ def rearrange_expert_weights_inplace(
             of tensors of shape (num_local_physical_experts, hidden_size_i).
             For example, a linear layer may have up and down projection,
             so weight_count = 2. Each weight's hidden size can be different.
-        ep_group: The device process group for expert parallelism.
+        ep_ctx: The EplbGroupContext for expert parallelism.
         communicator: EplbCommunicator instance for P2P communication.
         is_profile (bool): If `True`, do not perform any actual weight copy.
             This is used during profile run, where we only perform dummy
@@ -513,7 +512,7 @@ def rearrange_expert_weights_inplace(
         rank_mapping: A dictionary mapping old rank to new rank.
     """
     if rank_mapping is not None:
-        if len(rank_mapping) == ep_group.size():
+        if len(rank_mapping) == ep_ctx.size:
             # scale down
             new_global_expert_indices = _map_new_expert_indices_with_rank_mapping(
                 new_global_expert_indices,
@@ -524,7 +523,7 @@ def rearrange_expert_weights_inplace(
             old_global_expert_indices = _map_old_expert_indices_with_rank_mapping(
                 old_global_expert_indices,
                 rank_mapping,
-                ep_group.size(),
+                ep_ctx.size,
             )
 
     assert old_global_expert_indices.shape[1] == new_global_expert_indices.shape[1]
@@ -536,8 +535,8 @@ def rearrange_expert_weights_inplace(
     num_local_physical_experts = expert_weights[0][0].shape[0]
     assert new_global_expert_indices.shape == (num_moe_layers, num_physical_experts)
 
-    ep_size = ep_group.size()
-    ep_rank = ep_group.rank()
+    ep_size = ep_ctx.size
+    ep_rank = ep_ctx.rank
     assert num_physical_experts == ep_size * num_local_physical_experts
 
     first_layer_weights = list(expert_weights[0])
@@ -551,12 +550,8 @@ def rearrange_expert_weights_inplace(
         # Reserve communication buffers via a minimal dummy all_gather on first layer
         for weight, buffer in zip(expert_weights[0], weights_buffer):
             dummy_recv_buffer = [buffer for _ in range(ep_size)]
-            torch.distributed.barrier()
-            all_gather(
-                dummy_recv_buffer,
-                weight,
-                group=ep_group,
-            )
+            ep_ctx.barrier()
+            ep_ctx.all_gather(dummy_recv_buffer, weight)
         return
 
     # NOTE(bowen): We need this synchronize to run, but I don't know why.

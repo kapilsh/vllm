@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import socket
 import struct
+from datetime import timedelta
 from typing import Any, Optional
 
 import torch
@@ -79,6 +80,7 @@ class StatelessGroupCoordinator(GroupCoordinator):
         host: str = "127.0.0.1",
         global_rank: int = 0,
         global_world_size: int = 1,
+        use_torchcomms: bool = False,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -86,12 +88,24 @@ class StatelessGroupCoordinator(GroupCoordinator):
 
         self.rank = global_rank
         self.local_rank = local_rank
+        self.use_torchcomms = use_torchcomms
 
         self_device_group = None
         self_cpu_group = None
         self_tcp_store_group = None
+        self_device_comm = None
+        self_cpu_comm = None
 
         from vllm.platforms import current_platform
+
+        if current_platform.is_cuda_alike():
+            self.device = torch.device(f"cuda:{local_rank}")
+        elif current_platform.is_xpu():
+            self.device = torch.device(f"xpu:{local_rank}")
+        elif current_platform.is_out_of_tree():
+            self.device = torch.device(f"{current_platform.device_name}:{local_rank}")
+        else:
+            self.device = torch.device("cpu")
 
         backend = str(torch_distributed_backend)
         self.backend = backend
@@ -113,69 +127,138 @@ class StatelessGroupCoordinator(GroupCoordinator):
                     socks = []
                 device_port, cpu_port, tcp_store_port = ports
 
-                device_group = stateless_init_torch_distributed_process_group(
-                    host=host,
-                    port=device_port,
-                    rank=self.rank_in_group,
-                    world_size=self.world_size,
-                    backend=backend,
-                    group_name=f"{self.unique_name}_device",
-                    listen_socket=socks[0] if socks else None,
-                )
-                cpu_group = stateless_init_torch_distributed_process_group(
-                    host=host,
-                    port=cpu_port,
-                    rank=self.rank_in_group,
-                    world_size=self.world_size,
-                    backend="gloo",
-                    group_name=f"{self.unique_name}_cpu",
-                    listen_socket=socks[1] if socks else None,
-                )
-                tcp_store_group = StatelessProcessGroup.create(
-                    host=host,
-                    port=tcp_store_port,
-                    rank=self.rank_in_group,
-                    world_size=self.world_size,
-                    listen_socket=socks[2] if socks else None,
-                )
+                if use_torchcomms:
+                    import torchcomms
+
+                    # Close the pre-bound listen socket so TCPStore can bind.
+                    if socks:
+                        socks[0].close()
+                    tc_store = torch.distributed.TCPStore(
+                        host_name=host,
+                        port=device_port,
+                        world_size=self.world_size,
+                        is_master=(self.rank_in_group == 0),
+                        timeout=timedelta(seconds=300),
+                    )
+
+                    # Device comm (NCCL)
+                    device_prefix = torch.distributed.PrefixStore(
+                        f"{self.unique_name}/device", tc_store)
+                    device_comm = torchcomms.new_comm(
+                        backend, self.device,
+                        name=f"{self.unique_name}_device",
+                        store=device_prefix,
+                        timeout=timedelta(seconds=300),
+                    )
+
+                    # CPU comm (Gloo)
+                    cpu_prefix = torch.distributed.PrefixStore(
+                        f"{self.unique_name}/cpu", tc_store)
+                    cpu_comm = torchcomms.new_comm(
+                        "gloo", torch.device("cpu"),
+                        name=f"{self.unique_name}_cpu",
+                        store=cpu_prefix,
+                        timeout=timedelta(seconds=300),
+                    )
+
+                    # Close unused cpu_port socket
+                    if socks and len(socks) > 1:
+                        socks[1].close()
+
+                    device_group = None
+                    cpu_group = None
+
+                    tcp_store_group = StatelessProcessGroup.create(
+                        host=host,
+                        port=tcp_store_port,
+                        rank=self.rank_in_group,
+                        world_size=self.world_size,
+                        listen_socket=socks[2] if socks else None,
+                    )
+
+                    self_device_comm = device_comm
+                    self_cpu_comm = cpu_comm
+                else:
+                    device_group = stateless_init_torch_distributed_process_group(
+                        host=host,
+                        port=device_port,
+                        rank=self.rank_in_group,
+                        world_size=self.world_size,
+                        backend=backend,
+                        group_name=f"{self.unique_name}_device",
+                        listen_socket=socks[0] if socks else None,
+                    )
+                    cpu_group = stateless_init_torch_distributed_process_group(
+                        host=host,
+                        port=cpu_port,
+                        rank=self.rank_in_group,
+                        world_size=self.world_size,
+                        backend="gloo",
+                        group_name=f"{self.unique_name}_cpu",
+                        listen_socket=socks[1] if socks else None,
+                    )
+                    tcp_store_group = StatelessProcessGroup.create(
+                        host=host,
+                        port=tcp_store_port,
+                        rank=self.rank_in_group,
+                        world_size=self.world_size,
+                        listen_socket=socks[2] if socks else None,
+                    )
+                    device_comm = None
+                    cpu_comm = None
 
                 self_device_group = device_group
                 self_cpu_group = cpu_group
                 self_tcp_store_group = tcp_store_group
 
-        assert self_cpu_group is not None
-        assert self_device_group is not None
+        if not use_torchcomms:
+            assert self_cpu_group is not None
+            assert self_device_group is not None
         assert self_tcp_store_group is not None
 
         self.cpu_group = self_cpu_group
         self.device_group = self_device_group
         self.tcp_store_group = self_tcp_store_group
-
-        if current_platform.is_cuda_alike():
-            self.device = torch.device(f"cuda:{local_rank}")
-        elif current_platform.is_xpu():
-            self.device = torch.device(f"xpu:{local_rank}")
-        elif current_platform.is_out_of_tree():
-            self.device = torch.device(f"{current_platform.device_name}:{local_rank}")
-        else:
-            self.device = torch.device("cpu")
+        self.device_comm = self_device_comm
+        self.cpu_comm = self_cpu_comm
 
         self.use_device_communicator = use_device_communicator
         self.device_communicator = None
         if use_device_communicator and self.world_size > 1:
-            device_comm_cls = resolve_obj_by_qualname(
-                current_platform.get_device_communicator_cls()
-            )
-            assert device_comm_cls == CudaCommunicator
-            self.device_communicator = CudaCommunicator(
-                cpu_group=self.cpu_group,
-                device=self.device,
-                device_group=self.device_group,
-                unique_name=self.unique_name,
-                global_ranks=self.ranks,
-                global_world_size=global_world_size,
-                tcp_store_group=self.tcp_store_group,
-            )
+            if self.use_torchcomms and self.device_comm is not None:
+                from vllm.distributed.bootstrap import BootstrapInfo
+                from vllm.distributed.device_communicators.torchcomm_communicator import (
+                    TorchCommDeviceCommunicator,
+                )
+
+                info = BootstrapInfo(
+                    rank=self.rank,
+                    ranks=self.ranks,
+                    world_size=self.world_size,
+                    rank_in_group=self.rank_in_group,
+                )
+                self.device_communicator = TorchCommDeviceCommunicator(
+                    device=self.device,
+                    device_comm=self.device_comm,
+                    unique_name=self.unique_name,
+                    bootstrap_info=info,
+                    use_custom_allreduce=True,
+                    cpu_comm=self.cpu_comm,
+                )
+            else:
+                device_comm_cls = resolve_obj_by_qualname(
+                    current_platform.get_device_communicator_cls()
+                )
+                assert device_comm_cls == CudaCommunicator
+                self.device_communicator = CudaCommunicator(
+                    cpu_group=self.cpu_group,
+                    device=self.device,
+                    device_group=self.device_group,
+                    unique_name=self.unique_name,
+                    global_ranks=self.ranks,
+                    global_world_size=global_world_size,
+                    tcp_store_group=self.tcp_store_group,
+                )
 
         self.mq_broadcaster = None
 
@@ -187,10 +270,12 @@ class StatelessGroupCoordinator(GroupCoordinator):
     def destroy(self):
         if self.device_communicator:
             self.device_communicator.destroy()
-        if self.device_group:
+        if self.device_group is not None:
             stateless_destroy_torch_distributed_process_group(self.device_group)
-        if self.cpu_group:
+        if self.cpu_group is not None:
             stateless_destroy_torch_distributed_process_group(self.cpu_group)
+        self.device_comm = None
+        self.cpu_comm = None
 
     def size(self) -> int:
         """Return the world size of this group."""

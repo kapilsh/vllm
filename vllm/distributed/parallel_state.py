@@ -1306,6 +1306,7 @@ def _init_stateless_group(
     backend: str,
     coord_store: Store,
     use_device_communicator: bool = True,
+    use_torchcomms: bool = False,
 ) -> "StatelessGroupCoordinator":
     """Create a StatelessGroupCoordinator with the given parameters."""
     from vllm.distributed.stateless_coordinator import StatelessGroupCoordinator
@@ -1321,6 +1322,7 @@ def _init_stateless_group(
         coord_store=coord_store,
         global_rank=world.rank,
         global_world_size=world.world_size,
+        use_torchcomms=use_torchcomms,
     )
 
 
@@ -1489,6 +1491,7 @@ def _init_elastic_ep_world(
         coord_store=coord_store,
         global_rank=global_rank,
         global_world_size=global_world_size,
+        use_torchcomms=parallel_config.use_torchcomms,
     )
     assert parallel_config.nnodes_within_dp == 1, (
         "Elastic EP is not supported with multi-node TP/PP"
@@ -1805,6 +1808,7 @@ def initialize_model_parallel(
             parallel_config.data_parallel_master_ip,
             backend,
             coord_store=coord_store,
+            use_torchcomms=parallel_config.use_torchcomms,
         )
     else:
         _DP = init_model_parallel_group(
@@ -1833,6 +1837,7 @@ def initialize_model_parallel(
                 parallel_config.data_parallel_master_ip,
                 backend,
                 coord_store=coord_store,
+                use_torchcomms=parallel_config.use_torchcomms,
             )
         else:
             _EP = init_model_parallel_group(
@@ -1853,6 +1858,7 @@ def initialize_model_parallel(
                     parallel_config.data_parallel_master_ip,
                     backend,
                     coord_store=coord_store,
+                    use_torchcomms=parallel_config.use_torchcomms,
                 )
             else:
                 _EPLB = init_model_parallel_group(

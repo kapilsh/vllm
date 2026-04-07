@@ -9,7 +9,10 @@ import torch
 import torch.distributed
 
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.distributed.eplb.eplb_communicator import create_eplb_communicator
+from vllm.distributed.eplb.eplb_communicator import (
+    create_eplb_communicator,
+    create_eplb_group_context,
+)
 from vllm.distributed.eplb.rebalance_execute import (
     move_from_buffer,
     rearrange_expert_weights_inplace,
@@ -307,7 +310,7 @@ def _test_async_transfer_layer_without_mtp_worker(
         )
 
         ep_group_coordinator = get_tp_group()
-        ep_group = ep_group_coordinator.device_group
+        ep_ctx = create_eplb_group_context(ep_group_coordinator)
         ep_rank = torch.distributed.get_rank()
         device = torch.device(f"cuda:{ep_rank}")
 
@@ -364,7 +367,7 @@ def _test_async_transfer_layer_without_mtp_worker(
                     new_layer_indices=new_indices_cpu[layer_idx],
                     expert_weights=expert_weights[layer_idx],
                     expert_weights_buffer=expert_buffer,
-                    ep_group=ep_group,
+                    ep_ctx=ep_ctx,
                     communicator=communicator,
                     cuda_stream=cuda_stream,
                 )
@@ -426,7 +429,7 @@ def _test_rearrange_expert_weights_with_redundancy(
         )
 
         ep_group_coordinator = get_tp_group()
-        ep_group = ep_group_coordinator.cpu_group
+        ep_ctx = create_eplb_group_context(ep_group_coordinator)
         ep_rank = torch.distributed.get_rank()
         device = torch.device(f"cuda:{ep_rank}")
 
@@ -473,7 +476,7 @@ def _test_rearrange_expert_weights_with_redundancy(
             old_indices,
             new_indices,
             expert_weights,
-            ep_group,
+            ep_ctx,
             is_profile=False,
             communicator=communicator,
         )
@@ -561,7 +564,7 @@ def _test_rearrange_expert_weights_no_change(env, world_size) -> None:
         )
 
         ep_group_coordinator = get_tp_group()
-        ep_group = ep_group_coordinator.cpu_group
+        ep_ctx = create_eplb_group_context(ep_group_coordinator)
         ep_rank = torch.distributed.get_rank()
         device = torch.device(f"cuda:{ep_rank}")
 
@@ -602,7 +605,7 @@ def _test_rearrange_expert_weights_no_change(env, world_size) -> None:
             indices,
             indices,  # Same indices
             expert_weights,
-            ep_group,
+            ep_ctx,
             communicator,
             is_profile=False,
         )
@@ -683,7 +686,7 @@ def _test_rearrange_expert_weights_profile_mode(env, world_size) -> None:
         )
 
         ep_group_coordinator = get_tp_group()
-        ep_group = ep_group_coordinator.cpu_group
+        ep_ctx = create_eplb_group_context(ep_group_coordinator)
         ep_rank = torch.distributed.get_rank()
         device = torch.device(f"cuda:{ep_rank}")
 
@@ -731,7 +734,7 @@ def _test_rearrange_expert_weights_profile_mode(env, world_size) -> None:
             old_indices,
             new_indices,
             expert_weights,
-            ep_group,
+            ep_ctx,
             communicator,
             is_profile=True,  # Profile mode
         )
