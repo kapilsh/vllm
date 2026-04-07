@@ -1583,10 +1583,16 @@ def init_distributed_environment(
             timeout=timeout,
         )
         if enable_elastic_ep:
-            tp_pp_cpu_group = torch.distributed.new_group(
-                backend="gloo", timeout=timeout
-            )
-            if _node_count(tp_pp_cpu_group) > 1:
+            from vllm.distributed.bootstrap import TorchcommsBootstrap
+
+            if isinstance(bootstrap, TorchcommsBootstrap):
+                # Use the world CPU comm for node count check (no PG needed).
+                tp_pp_comm = bootstrap._world_cpu_comm
+            else:
+                tp_pp_comm = torch.distributed.new_group(
+                    backend="gloo", timeout=timeout
+                )
+            if _node_count(tp_pp_comm) > 1:
                 # NOTE(yongji): StatelessGroupCoordinator uses data_parallel_master_ip
                 # to initialize all DP/EP groups, hence all ranks within TP/PP group
                 # must reside on the same node

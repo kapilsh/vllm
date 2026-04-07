@@ -4,9 +4,12 @@
 
 import numpy as np
 import torch
-import torch.distributed as dist
 
 from vllm.config import ParallelConfig
+from vllm.distributed.eplb.eplb_communicator import (
+    EplbGroupContext,
+    create_eplb_group_context,
+)
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.logger import init_logger
 from vllm.v1.worker.ubatch_utils import (
@@ -17,10 +20,11 @@ from vllm.v1.worker.ubatch_utils import (
 logger = init_logger(__name__)
 
 
-def _get_device_and_group(parallel_config: ParallelConfig):
-    # Use the actual device assigned to the DP group, not just the device type
-    device = get_dp_group().device
-    group = get_dp_group().device_group
+def _get_device_and_ctx(
+    parallel_config: ParallelConfig,
+) -> tuple[torch.device | str, EplbGroupContext]:
+    dp = get_dp_group()
+    device: torch.device | str = dp.device
 
     # Transferring this tensor from GPU to CPU will introduce a GPU sync
     # point that could adversely affect performance of vllm with asynch
@@ -32,8 +36,8 @@ def _get_device_and_group(parallel_config: ParallelConfig):
             scope="local",
         )
         device = "cpu"
-        group = get_dp_group().cpu_group
-    return device, group
+
+    return device, create_eplb_group_context(dp)
 
 
 def _run_ar(
@@ -45,13 +49,13 @@ def _run_ar(
 ) -> torch.Tensor:
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
-    device, group = _get_device_and_group(parallel_config)
+    device, ctx = _get_device_and_ctx(parallel_config)
     tensor = torch.zeros(4, dp_size, device=device, dtype=torch.int32)
     tensor[0][dp_rank] = orig_num_tokens_per_ubatch
     tensor[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor[2][dp_rank] = 1 if should_ubatch else 0
     tensor[3][dp_rank] = cudagraph_mode
-    dist.all_reduce(tensor, group=group)
+    ctx.all_reduce_sum(tensor)
     return tensor
 
 
