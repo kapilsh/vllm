@@ -21,7 +21,11 @@ logger = logging.getLogger(__name__)
 
 
 class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
-    """Uses a ``TorchComm`` object for device-level collectives."""
+    """Uses a ``TorchComm`` object for device-level collectives.
+
+    Optionally integrates Custom AllReduce (CUDA IPC) for small tensors
+    where it outperforms NCCL.
+    """
 
     def __init__(
         self,
@@ -31,6 +35,8 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
         device_comm: Any = None,
         unique_name: str = "",
         bootstrap_info: Any = None,
+        use_custom_allreduce: bool = False,
+        cpu_comm: Any = None,
     ):
         super().__init__(
             cpu_group=cpu_group,
@@ -43,13 +49,41 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
             "TorchCommDeviceCommunicator requires a TorchComm object"
         )
         self.comm = device_comm
+
+        # Optional Custom AllReduce for small tensors (CUDA IPC).
+        self.ca_comm = None
+        if use_custom_allreduce and self.world_size > 1:
+            from vllm.distributed.device_communicators.custom_all_reduce import (
+                CustomAllreduce,
+            )
+            self.ca_comm = CustomAllreduce(
+                group=cpu_group,
+                device=device,
+                cpu_comm=cpu_comm,
+                rank=self.rank,
+                world_size=self.world_size,
+            )
+            if self.ca_comm.disabled:
+                self.ca_comm = None
+            else:
+                logger.info(
+                    "[torchcomms] Custom AllReduce enabled for %s",
+                    unique_name,
+                )
+
         logger.info("[torchcomms] TorchCommDeviceCommunicator initialized: "
                      "unique_name=%s, device=%s, rank=%d, world_size=%d, "
-                     "comm=%s",
+                     "comm=%s, ca_comm=%s",
                      unique_name, device, self.rank, self.world_size,
-                     device_comm)
+                     device_comm, self.ca_comm is not None)
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        # Try Custom AllReduce first (fast IPC path for small tensors).
+        if self.ca_comm is not None:
+            out = self.ca_comm.custom_all_reduce(input_)
+            if out is not None:
+                return out
+
         import torchcomms
 
         # Must be out-of-place: the vllm::all_reduce custom op's fake
@@ -159,3 +193,8 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
         if self.rank_in_group == dst:
             return torch.cat(gather_list, dim=dim)
         return None
+
+    def destroy(self):
+        if self.ca_comm is not None:
+            self.ca_comm.close()
+            self.ca_comm = None

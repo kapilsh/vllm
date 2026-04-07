@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
 from contextlib import contextmanager
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -28,6 +31,139 @@ except Exception:
 logger = init_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Coordination backend — abstracts metadata exchange for Custom AllReduce
+# ---------------------------------------------------------------------------
+
+
+class CoordinationBackend(ABC):
+    """Abstraction for CPU-side metadata exchange used by Custom AllReduce.
+
+    Custom AllReduce needs to exchange IPC handles, device IDs, and graph
+    buffer metadata across ranks.  This can be done via either a
+    ``torch.distributed`` ProcessGroup or a TorchComm communicator.
+    """
+
+    @property
+    @abstractmethod
+    def rank(self) -> int:
+        """Return this process's rank within the group."""
+        ...
+
+    @property
+    @abstractmethod
+    def world_size(self) -> int:
+        """Return the number of ranks in the group."""
+        ...
+
+    @property
+    @abstractmethod
+    def ranks(self) -> list[int]:
+        """Return sorted global ranks in the group."""
+        ...
+
+    @abstractmethod
+    def all_gather_object(self, obj: Any) -> list[Any]:
+        """All-gather a picklable Python object from every rank."""
+        ...
+
+    @abstractmethod
+    def broadcast_object_list(
+        self, obj_list: list[Any], src: int
+    ) -> None:
+        """Broadcast an object list from ``src`` to all ranks."""
+        ...
+
+    @abstractmethod
+    def in_same_node(self) -> bool:
+        """Return True if all ranks are on the same node."""
+        ...
+
+
+class ProcessGroupCoordination(CoordinationBackend):
+    """Coordination via a ``torch.distributed`` ProcessGroup (gloo)."""
+
+    def __init__(self, group: ProcessGroup) -> None:
+        self._group = group
+        assert dist.get_backend(group) != dist.Backend.NCCL, (
+            "CustomAllreduce should be attached to a non-NCCL group."
+        )
+
+    @property
+    def rank(self) -> int:
+        return dist.get_rank(group=self._group)
+
+    @property
+    def world_size(self) -> int:
+        return dist.get_world_size(group=self._group)
+
+    @property
+    def ranks(self) -> list[int]:
+        return sorted(dist.get_process_group_ranks(group=self._group))
+
+    def all_gather_object(self, obj: Any) -> list[Any]:
+        result: list[Any] = [None] * self.world_size
+        dist.all_gather_object(result, obj, group=self._group)
+        return result
+
+    def broadcast_object_list(
+        self, obj_list: list[Any], src: int
+    ) -> None:
+        dist.broadcast_object_list(
+            obj_list, src=src, group=self._group, device="cpu"
+        )
+
+    def in_same_node(self) -> bool:
+        return all(in_the_same_node_as(self._group, source_rank=0))
+
+
+class TorchCommCoordination(CoordinationBackend):
+    """Coordination via a TorchComm communicator (no ProcessGroup needed)."""
+
+    def __init__(
+        self, cpu_comm: Any, rank: int, world_size: int
+    ) -> None:
+        self._comm = cpu_comm
+        self._rank = rank
+        self._world_size = world_size
+
+    @property
+    def rank(self) -> int:
+        return self._rank
+
+    @property
+    def world_size(self) -> int:
+        return self._world_size
+
+    @property
+    def ranks(self) -> list[int]:
+        return list(range(self._world_size))
+
+    def all_gather_object(self, obj: Any) -> list[Any]:
+        import torchcomms.objcol
+        result: list[Any] = [None] * self._world_size
+        torchcomms.objcol.all_gather_object(
+            self._comm, result, obj, weights_only=False
+        )
+        return result
+
+    def broadcast_object_list(
+        self, obj_list: list[Any], src: int
+    ) -> None:
+        import torchcomms.objcol
+        torchcomms.objcol.broadcast_object_list(
+            self._comm, obj_list, root=src, weights_only=False
+        )
+
+    def in_same_node(self) -> bool:
+        return all(in_the_same_node_as(self._comm, source_rank=0))
+
+
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
+
+
 def _can_p2p(rank: int, world_size: int) -> bool:
     for i in range(world_size):
         if i == rank:
@@ -47,58 +183,66 @@ def is_weak_contiguous(inp: torch.Tensor):
     )
 
 
+# ---------------------------------------------------------------------------
+# CustomAllreduce
+# ---------------------------------------------------------------------------
+
+
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
 
     # max_size: max supported allreduce size
     def __init__(
         self,
-        group: ProcessGroup,
-        device: int | str | torch.device,
-        max_size=8192 * 1024,
-        symm_mem_enabled=False,
+        group: ProcessGroup | None = None,
+        device: int | str | torch.device = "cuda:0",
+        max_size: int = 8192 * 1024,
+        symm_mem_enabled: bool = False,
+        cpu_comm: Any | None = None,
+        rank: int | None = None,
+        world_size: int | None = None,
     ) -> None:
         """
         Args:
-            group: the process group to work on. If None, it will use the
-                default process group.
-            device: the device to bind the CustomAllreduce to. If None,
-                it will be bound to f"cuda:{local_rank}".
-        It is the caller's responsibility to make sure each communicator
-        is bind to a unique device, and all communicators in this group
-        are in the same node.
+            group: ProcessGroup for coordination (standard path).
+            device: the device to bind the CustomAllreduce to.
+            cpu_comm: TorchComm for coordination (torchcomms path).
+                Exactly one of ``group`` or ``cpu_comm`` must be provided.
+            rank: explicit rank (required when using cpu_comm).
+            world_size: explicit world_size (required when using cpu_comm).
         """
         self._IS_CAPTURING = False
         self.disabled = True
 
         if not custom_ar:
-            # disable because of missing custom allreduce library
-            # e.g. in a non-GPU environment
             logger.info(
                 "Custom allreduce is disabled because "
                 "of missing custom allreduce library"
             )
             return
 
-        self.group = group
+        # Build the coordination backend.
+        if cpu_comm is not None:
+            assert rank is not None and world_size is not None, (
+                "rank and world_size required with cpu_comm"
+            )
+            self._coord = TorchCommCoordination(cpu_comm, rank, world_size)
+        elif group is not None:
+            self._coord = ProcessGroupCoordination(group)
+        else:
+            raise ValueError("Either group or cpu_comm must be provided")
 
-        assert dist.get_backend(group) != dist.Backend.NCCL, (
-            "CustomAllreduce should be attached to a non-NCCL group."
-        )
-
-        if not all(in_the_same_node_as(group, source_rank=0)):
-            # No need to initialize custom allreduce for multi-node case.
+        if not self._coord.in_same_node():
             logger.warning(
                 "Custom allreduce is disabled because this process group"
                 " spans across nodes."
             )
             return
 
-        rank = dist.get_rank(group=self.group)
+        rank = self._coord.rank
+        world_size = self._coord.world_size
         self.rank = rank
-        world_size = dist.get_world_size(group=self.group)
         if world_size == 1:
-            # No need to initialize custom allreduce for single GPU case.
             return
 
         if world_size not in CustomAllreduce._SUPPORTED_WORLD_SIZES:
@@ -115,7 +259,6 @@ class CustomAllreduce:
             device = torch.device(f"cuda:{device}")
         elif isinstance(device, str):
             device = torch.device(device)
-        # now `device` is a `torch.device` object
         assert isinstance(device, torch.device)
         self.device = device
         device_capability = current_platform.get_device_capability()
@@ -137,12 +280,7 @@ class CustomAllreduce:
             device_ids = list(range(current_platform.device_count()))
 
         physical_device_id = device_ids[device.index]
-        tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-        gather_list = [
-            torch.tensor([0], dtype=torch.int, device="cpu") for _ in range(world_size)
-        ]
-        dist.all_gather(gather_list, tensor, group=self.group)
-        physical_device_ids = [t.item() for t in gather_list]
+        physical_device_ids = self._coord.all_gather_object(physical_device_id)
 
         # test nvlink first, this will filter out most of the cases
         # where custom allreduce is not supported
@@ -172,12 +310,12 @@ class CustomAllreduce:
         # Buffers memory are owned by this Python class and passed to C++.
         # Metadata composes of two parts: metadata for synchronization and a
         # temporary buffer for storing intermediate allreduce results.
-        self.meta_ptrs = self.create_shared_buffer(
-            ops.meta_size() + max_size, group=group, uncached=True
+        self.meta_ptrs = self._create_shared_buffer(
+            ops.meta_size() + max_size, rank, world_size
         )
         # This is a pre-registered IPC buffer. In eager mode, input tensors
         # are first copied into this buffer before allreduce is performed
-        self.buffer_ptrs = self.create_shared_buffer(max_size, group=group)
+        self.buffer_ptrs = self._create_shared_buffer(max_size, rank, world_size)
         # This is a buffer for storing the tuples of pointers pointing to
         # IPC buffers from all ranks. Each registered tuple has size of
         # 8*world_size bytes where world_size is at most 8. Allocating 8MB
@@ -194,6 +332,10 @@ class CustomAllreduce:
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
+
+    # ------------------------------------------------------------------
+    # CUDA graph capture
+    # ------------------------------------------------------------------
 
     @contextmanager
     def capture(self):
@@ -217,17 +359,19 @@ class CustomAllreduce:
         # because it is incompatible with `gloo` backend under inference mode.
         # see https://github.com/pytorch/pytorch/issues/126032 for details.
         all_data: list[list[list[int] | None]]
-        all_data = [[None, None] for _ in range(dist.get_world_size(group=self.group))]
+        all_data = [[None, None] for _ in range(self.world_size)]
         all_data[self.rank] = [handle, offset]
-        ranks = sorted(dist.get_process_group_ranks(group=self.group))
+        ranks = self._coord.ranks
         for i, rank in enumerate(ranks):
-            dist.broadcast_object_list(
-                all_data[i], src=rank, group=self.group, device="cpu"
-            )
+            self._coord.broadcast_object_list(all_data[i], src=rank)
         # Unpack list of tuples to tuple of lists.
         handles = cast(list[list[int]], [d[0] for d in all_data])
         offsets = cast(list[list[int]], [d[1] for d in all_data])
         ops.register_graph_buffers(self._ptr, handles, offsets)
+
+    # ------------------------------------------------------------------
+    # AllReduce
+    # ------------------------------------------------------------------
 
     def should_custom_ar(self, inp: torch.Tensor):
         if self.disabled:
@@ -281,6 +425,10 @@ class CustomAllreduce:
             # latency) compared to the performance gain of using custom kernels
             return self.all_reduce(input, registered=False)
 
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
     def close(self):
         if not self.disabled and self._ptr:
             if ops is not None:
@@ -292,12 +440,35 @@ class CustomAllreduce:
     def __del__(self):
         self.close()
 
+    # ------------------------------------------------------------------
+    # Shared buffer management
+    # ------------------------------------------------------------------
+
+    def _create_shared_buffer(
+        self,
+        size_in_bytes: int,
+        rank: int,
+        world_size: int,
+    ) -> list[int]:
+        """Allocate an IPC buffer and exchange handles via the coord backend."""
+        pointer, handle = ops.allocate_shared_buffer_and_handle(size_in_bytes)
+        handles = self._coord.all_gather_object(handle)
+
+        pointers: list[int] = []
+        for i, h in enumerate(handles):
+            if i == rank:
+                pointers.append(pointer)  # type: ignore
+            else:
+                pointers.append(ops.open_mem_handle(h))
+        return pointers
+
     @staticmethod
     def create_shared_buffer(
         size_in_bytes: int,
         group: ProcessGroup | None = None,
         uncached: bool | None = False,
     ) -> list[int]:
+        """Legacy static method — uses torch.distributed directly."""
         pointer, handle = ops.allocate_shared_buffer_and_handle(size_in_bytes)
 
         world_size = dist.get_world_size(group=group)

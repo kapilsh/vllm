@@ -395,6 +395,8 @@ class GroupCoordinator:
                     device_comm=self.device_comm,
                     unique_name=self.unique_name,
                     bootstrap_info=info,
+                    use_custom_allreduce=_ENABLE_CUSTOM_ALL_REDUCE,
+                    cpu_comm=self.cpu_comm,
                 )
             else:
                 device_comm_cls = resolve_obj_by_qualname(
@@ -511,18 +513,11 @@ class GroupCoordinator:
         # only cuda uses this function,
         # so we don't abstract it into the base class
         maybe_ca_context = nullcontext()
-        from vllm.distributed.device_communicators.cuda_communicator import (
-            CudaCommunicator,
-        )
-
-        if self.device_communicator is not None and isinstance(
-            self.device_communicator, CudaCommunicator
-        ):
-            ca_comm = self.device_communicator.ca_comm
-            if ca_comm is not None:
-                maybe_ca_context = ca_comm.capture()  # type: ignore
-            logger.info("graph_capture: using CudaCommunicator "
-                        "(ca_comm=%s)", ca_comm is not None)
+        ca_comm = getattr(self.device_communicator, "ca_comm", None)
+        if ca_comm is not None:
+            maybe_ca_context = ca_comm.capture()  # type: ignore
+            logger.info("graph_capture: using %s (ca_comm=True)",
+                        type(self.device_communicator).__name__)
         elif self.device_communicator is not None:
             logger.info("graph_capture: using %s (no custom allreduce "
                         "capture needed)",
