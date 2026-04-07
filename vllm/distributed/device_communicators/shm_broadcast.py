@@ -788,11 +788,13 @@ class MessageQueue:
 
     @staticmethod
     def create_from_process_group_single_reader(
-        pg: ProcessGroup,
+        pg,
         max_chunk_bytes,
         max_chunks,
         reader_rank: int = 0,
         blocking: bool = False,
+        rank: int | None = None,
+        world_size: int | None = None,
     ) -> tuple["MessageQueue", list[Handle]]:
         """
         Creates a MessageQueue for a process group with a single reader.
@@ -803,31 +805,61 @@ class MessageQueue:
         gathers the handles from all processes to the reader.
 
         Args:
-            pg (ProcessGroup): The torch distributed process group.
-            max_chunk_bytes (int): Maximum size in bytes for each chunk in the buffer.
+            pg: ProcessGroup or TorchComm communicator.
+            max_chunk_bytes (int): Maximum size in bytes for each chunk.
             max_chunks (int): Maximum number of chunks in the buffer.
-            reader_rank (int, optional): The global rank that will act as the reader.
-                Defaults to 0.
-            blocking (bool, optional): If True, blocks until all processes are ready.
-                Defaults to False.
+            reader_rank (int, optional): The global rank that will act as
+                the reader. Defaults to 0.
+            blocking (bool, optional): If True, blocks until ready.
+            rank (int, optional): Explicit rank (required for TorchComm).
+            world_size (int, optional): Explicit world_size (for TorchComm).
 
         Returns:
             tuple[MessageQueue, list[Handle]]:
             The MessageQueue instance for the calling process,
             and a list of handles (only non-empty for the reader process).
         """
-        local_size = current_platform.device_count()
-        rank = dist.get_rank()
-        same_node = rank // local_size == reader_rank // local_size
-        buffer_io = MessageQueue(
-            n_reader=1,
-            n_local_reader=1 if same_node else 0,
-            max_chunk_bytes=max_chunk_bytes,
-            max_chunks=max_chunks,
-        )
-        handle = buffer_io.export_handle()
-        handles = [None] * dist.get_world_size(pg) if rank == reader_rank else None
-        dist.gather_object(handle, handles, dst=reader_rank, group=pg)
+        from vllm.distributed.parallel_state import _is_torchcomm
+
+        if _is_torchcomm(pg):
+            import torchcomms.objcol
+
+            assert rank is not None and world_size is not None
+            local_size = current_platform.device_count()
+            same_node = rank // local_size == reader_rank // local_size
+            buffer_io = MessageQueue(
+                n_reader=1,
+                n_local_reader=1 if same_node else 0,
+                max_chunk_bytes=max_chunk_bytes,
+                max_chunks=max_chunks,
+            )
+            handle = buffer_io.export_handle()
+            handles = [None] * world_size if rank == reader_rank else None
+            torchcomms.objcol.gather_object(
+                pg, handle, root=reader_rank,
+                object_gather_list=handles, weights_only=False,
+            )
+        else:
+            assert pg is not None, (
+                "create_from_process_group_single_reader requires a "
+                "ProcessGroup or TorchComm, got None."
+            )
+            local_size = current_platform.device_count()
+            pg_rank = dist.get_rank()
+            same_node = pg_rank // local_size == reader_rank // local_size
+            buffer_io = MessageQueue(
+                n_reader=1,
+                n_local_reader=1 if same_node else 0,
+                max_chunk_bytes=max_chunk_bytes,
+                max_chunks=max_chunks,
+            )
+            handle = buffer_io.export_handle()
+            handles = (
+                [None] * dist.get_world_size(pg)
+                if pg_rank == reader_rank else None
+            )
+            dist.gather_object(handle, handles, dst=reader_rank, group=pg)
+
         if blocking:
             buffer_io.wait_until_ready()
         return buffer_io, cast(list[Handle], handles or [])

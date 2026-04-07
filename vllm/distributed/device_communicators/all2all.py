@@ -710,12 +710,22 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             moe_ep_size=self.world_size,
         )
 
-        from vllm.distributed.device_communicators.mnnvl_compat import (
-            CustomCommunicator,
-        )
+        dp_group = get_dp_group()
+        cpu_group = dp_group.cpu_group
+        if cpu_group is not None:
+            from vllm.distributed.device_communicators.mnnvl_compat import (
+                CustomCommunicator,
+            )
+            mnnvl_comm_backend = CustomCommunicator(cpu_group)
+        else:
+            raise RuntimeError(
+                "FlashInfer NVLink one-sided all2all requires a CPU "
+                "ProcessGroup but none is available. This backend is "
+                "not supported with torchcomms."
+            )
 
         dp_config = MnnvlConfig(
-            comm_backend=CustomCommunicator(get_dp_group().cpu_group),
+            comm_backend=mnnvl_comm_backend,
         )
         total_dispatch_payload_size_per_token = (
             hidden_size // 2  # nvfp4 hidden states
@@ -752,7 +762,7 @@ class FlashInferNVLinkOneSidedManager(All2AllManagerBase):
             self.rank,
             self.world_size,
         )
-        dist.barrier()
+        torch.distributed.barrier(group=self.cpu_group)
 
     def get_handle(self, kwargs):
         return self

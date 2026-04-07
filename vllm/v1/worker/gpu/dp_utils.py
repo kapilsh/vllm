@@ -5,7 +5,10 @@ from __future__ import annotations
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
-from vllm.distributed.eplb.eplb_communicator import create_eplb_group_context
+from vllm.distributed.eplb.eplb_communicator import (
+    ProcessGroupEplbContext,
+    TorchCommEplbContext,
+)
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.v1.worker.gpu.cudagraph_utils import (
     BatchExecutionDescriptor,
@@ -34,7 +37,17 @@ def sync_cudagraph_and_dp_padding(
     Returns (synced_batch_desc, num_tokens_across_dp).
     """
     assert dp_size > 1, "DP size must be greater than 1"
-    ctx = create_eplb_group_context(get_dp_group())
+    dp = get_dp_group()
+    # This always runs on CPU tensors.
+    if dp.cpu_comm is not None:
+        ctx = TorchCommEplbContext(
+            device_comm=dp.cpu_comm,
+            rank=dp.rank_in_group,
+            size=dp.world_size,
+        )
+    else:
+        assert dp.cpu_group is not None
+        ctx = ProcessGroupEplbContext(dp.cpu_group)
     tensor = torch.zeros(3, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value

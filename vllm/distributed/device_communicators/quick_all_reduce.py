@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from enum import Enum
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -10,7 +11,11 @@ from torch.distributed import ProcessGroup
 import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.config import get_current_vllm_config_or_none
-from vllm.distributed.parallel_state import in_the_same_node_as
+from vllm.distributed.device_communicators.custom_all_reduce import (
+    CoordinationBackend,
+    ProcessGroupCoordination,
+    TorchCommCoordination,
+)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -56,7 +61,14 @@ class QuickAllReduce:
         (torch.bfloat16, 8): [16 * MB, 2048 * MB, 2048 * MB, 2048 * MB],
     }
 
-    def __init__(self, group: ProcessGroup, device: int | str | torch.device) -> None:
+    def __init__(
+        self,
+        group: ProcessGroup | None = None,
+        device: int | str | torch.device = "cuda:0",
+        cpu_comm: Any | None = None,
+        rank: int | None = None,
+        world_size: int | None = None,
+    ) -> None:
         """
         Custom allreduce provides non-destructive acceleration and is
         available for CUDA and ROCm MI300 series.
@@ -72,10 +84,12 @@ class QuickAllReduce:
         this time.
 
         Args:
-            group: the process group to work on. If None, it will use the
-                default process group.
-            device: the device to bind the CustomAllreduce to. If None,
-                it will be bound to f"cuda:{local_rank}".
+            group: ProcessGroup for coordination (standard path).
+            device: the device to bind the CustomAllreduce to.
+            cpu_comm: TorchComm for coordination (torchcomms path).
+                Exactly one of ``group`` or ``cpu_comm`` must be provided.
+            rank: explicit rank (required when using cpu_comm).
+            world_size: explicit world_size (required when using cpu_comm).
         It is the caller's responsibility to make sure each communicator
         is bind to a unique device, and all communicators in this group
         are in the same node.
@@ -96,11 +110,21 @@ class QuickAllReduce:
             )
             return
 
-        self.group = group
-        assert dist.get_backend(group) != dist.Backend.NCCL, (
-            "Custom quick allreduce should be attached to a non-NCCL group."
-        )
-        if not all(in_the_same_node_as(group, source_rank=0)):
+        # Build the coordination backend.
+        if cpu_comm is not None:
+            assert rank is not None and world_size is not None, (
+                "rank and world_size required with cpu_comm"
+            )
+            self._coord = TorchCommCoordination(cpu_comm, rank, world_size)
+        elif group is not None:
+            assert dist.get_backend(group) != dist.Backend.NCCL, (
+                "Custom quick allreduce should be attached to a non-NCCL group."
+            )
+            self._coord = ProcessGroupCoordination(group)
+        else:
+            raise ValueError("Either group or cpu_comm must be provided")
+
+        if not self._coord.in_same_node():
             # No need to initialize custom quick allreduce for
             # multi-node case.
             logger.warning(
@@ -108,8 +132,8 @@ class QuickAllReduce:
                 "process group spans across nodes."
             )
             return
-        rank = dist.get_rank(group=self.group)
-        world_size = dist.get_world_size(group=self.group)
+        rank = self._coord.rank
+        world_size = self._coord.world_size
         self.rank = rank
         self.world_size = world_size
         if world_size == 1:
@@ -138,13 +162,7 @@ class QuickAllReduce:
         else:
             device_ids = list(range(current_platform.device_count()))
         physical_device_id = device_ids[device.index]
-        tensor = torch.tensor([physical_device_id], dtype=torch.int, device="cpu")
-        gather_list = [
-            torch.tensor([0], dtype=torch.int, device="cpu")
-            for _ in range(self.world_size)
-        ]
-        dist.all_gather(gather_list, tensor, group=self.group)
-        physical_device_ids = [t.item() for t in gather_list]
+        physical_device_ids = self._coord.all_gather_object(physical_device_id)
 
         # test nvlink first, this will filter out most of the cases
         # where custom quick allreduce is not supported
@@ -238,9 +256,7 @@ class QuickAllReduce:
         Has to be called after init_custom_qr
         """
         handle = ops.qr_get_handle(self._ptr)
-        world_size = dist.get_world_size(group=self.group)
-        handles = [None] * world_size
-        dist.all_gather_object(handles, handle, group=self.group)
+        handles = self._coord.all_gather_object(handle)
         ops.qr_open_handles(self._ptr, handles)
 
     def should_quick_allreduce(self, inp: torch.Tensor):

@@ -422,13 +422,15 @@ class GroupCoordinator:
 
         self.mq_broadcaster: MessageQueue | None = None
         if use_message_queue_broadcaster and self.world_size > 1:
-            # Prefer cpu_comm (TorchComm) when available for PG-free setup,
-            # fall back to cpu_group (ProcessGroup).
-            mq_coord = self.cpu_comm if self.cpu_comm is not None \
-                else self.cpu_group
-            if mq_coord is not None:
+            if self.cpu_comm is not None:
+                # TorchComm path
                 self.mq_broadcaster = MessageQueue.create_from_process_group(
-                    mq_coord, 1 << 22, 6
+                    self.cpu_comm, 1 << 22, 6
+                )
+            elif self.cpu_group is not None:
+                # ProcessGroup path
+                self.mq_broadcaster = MessageQueue.create_from_process_group(
+                    self.cpu_group, 1 << 22, 6
                 )
 
         # TODO(#35915): Remove is_tpu() check once tpu_inference
@@ -460,12 +462,29 @@ class GroupCoordinator:
     ):
         from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 
+        if self.cpu_comm is not None:
+            # TorchComm path
+            return MessageQueue.create_from_process_group_single_reader(
+                self.cpu_comm,
+                1 << 22,
+                6,
+                reader_rank=self.ranks[reader_rank_in_group],
+                blocking=blocking,
+                rank=self.rank,
+                world_size=self.world_size,
+            )
+        assert self.cpu_group is not None, (
+            "create_single_reader_mq_broadcasters requires a cpu_group "
+            "(ProcessGroup) when not using torchcomms."
+        )
         return MessageQueue.create_from_process_group_single_reader(
             self.cpu_group,
             1 << 22,
             6,
             reader_rank=self.ranks[reader_rank_in_group],
             blocking=blocking,
+            rank=self.rank,
+            world_size=self.world_size,
         )
 
     @property
@@ -1618,10 +1637,11 @@ def init_distributed_environment(
         if config is not None and config.parallel_config.nnodes > 1:
             _NODE_COUNT = config.parallel_config.nnodes
         else:
-            # Prefer cpu_comm (TorchComm) when PG is not available.
-            _nc_pg = _WORLD.cpu_comm if _WORLD.cpu_group is None \
-                else _WORLD.cpu_group
-            _NODE_COUNT = _node_count(_nc_pg)
+            if _WORLD.cpu_comm is not None:
+                _NODE_COUNT = _node_count(_WORLD.cpu_comm)
+            else:
+                assert _WORLD.cpu_group is not None
+                _NODE_COUNT = _node_count(_WORLD.cpu_group)
         logger.debug("Detected %d nodes in the distributed environment", _NODE_COUNT)
     else:
         assert _WORLD.world_size == bootstrap.get_world_size(), (

@@ -8,7 +8,8 @@ import torch
 from vllm.config import ParallelConfig
 from vllm.distributed.eplb.eplb_communicator import (
     EplbGroupContext,
-    create_eplb_group_context,
+    ProcessGroupEplbContext,
+    TorchCommEplbContext,
 )
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.logger import init_logger
@@ -24,20 +25,29 @@ def _get_device_and_ctx(
     parallel_config: ParallelConfig,
 ) -> tuple[torch.device | str, EplbGroupContext]:
     dp = get_dp_group()
-    device: torch.device | str = dp.device
+    use_cpu = parallel_config.disable_nccl_for_dp_synchronization
 
-    # Transferring this tensor from GPU to CPU will introduce a GPU sync
-    # point that could adversely affect performance of vllm with asynch
-    # scheduling. This environment variable exists to quickly disable
-    # this optimization if we run into this case.
-    if parallel_config.disable_nccl_for_dp_synchronization:
+    if use_cpu:
         logger.info_once(
             "Using CPU all reduce to synchronize DP padding between ranks.",
             scope="local",
         )
-        device = "cpu"
 
-    return device, create_eplb_group_context(dp)
+    if dp.cpu_comm is not None:
+        # TorchComm path — cpu_comm handles both CPU and device tensors
+        return ("cpu" if use_cpu else dp.device,
+                TorchCommEplbContext(
+                    device_comm=dp.cpu_comm if use_cpu else dp.device_comm,
+                    rank=dp.rank_in_group,
+                    size=dp.world_size,
+                ))
+
+    # ProcessGroup path
+    if use_cpu:
+        assert dp.cpu_group is not None
+        return "cpu", ProcessGroupEplbContext(dp.cpu_group)
+    assert dp.device_group is not None
+    return dp.device, ProcessGroupEplbContext(dp.device_group)
 
 
 def _run_ar(
