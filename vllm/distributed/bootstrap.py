@@ -128,6 +128,19 @@ class ProcessGroupBootstrap(BootstrapProvider):
             kwargs["init_method"] = init_method
         if timeout is not None:
             kwargs["timeout"] = timeout
+        # When TORCH_DISTRIBUTED_USE_TORCHCOMMS=1, the TorchComm backend
+        # ignores the rank/world_size kwargs and reads env vars instead.
+        # Also needs MASTER_ADDR/MASTER_PORT for its StoreManager.
+        # Propagate them so vLLM's multiproc-spawned workers can init.
+        if os.environ.get("TORCH_DISTRIBUTED_USE_TORCHCOMMS") == "1":
+            os.environ["TORCHCOMM_RANK"] = str(rank)
+            os.environ["TORCHCOMM_SIZE"] = str(world_size)
+            if init_method and init_method.startswith("tcp://"):
+                # Parse "tcp://host:port" into MASTER_ADDR and MASTER_PORT
+                addr_port = init_method[len("tcp://"):]
+                host, port = addr_port.rsplit(":", 1)
+                os.environ.setdefault("MASTER_ADDR", host)
+                os.environ.setdefault("MASTER_PORT", port)
         torch.distributed.init_process_group(**kwargs)
 
     def is_initialized(self) -> bool:
@@ -217,6 +230,7 @@ class TorchcommsBootstrap(BootstrapProvider):
         group_name: str | None = None,
     ) -> None:
         self._store = store
+        self._cached_store: torch.distributed.Store | None = None
         self._device = device
         self._timeout = timeout or timedelta(seconds=300)
         self._group_name = group_name or "vllm"
@@ -303,6 +317,8 @@ class TorchcommsBootstrap(BootstrapProvider):
                         os.environ.get("MASTER_ADDR"),
                         os.environ.get("MASTER_PORT"))
 
+        self._init_method = init_method
+
     def is_initialized(self) -> bool:
         return self._initialized
 
@@ -320,17 +336,19 @@ class TorchcommsBootstrap(BootstrapProvider):
 
         When a store was provided at construction time, use it directly.
         Otherwise, create a TCPStore from MASTER_ADDR/MASTER_PORT env vars
-        (which init() will have populated).
+        (which init() will have populated).  The store is cached so that
+        multiple callers (torchcomms, torch.distributed PGs) share one
+        TCPStore instead of fighting over the port.
         """
         if self._store is not None:
-            logger.info("[torchcomms] Using user-provided store: %s",
-                        type(self._store).__name__)
             return self._store
+        if self._cached_store is not None:
+            return self._cached_store
         # Create a TCPStore from env vars — no torch.distributed dependency.
         host = os.environ.get("MASTER_ADDR", "127.0.0.1")
         port = int(os.environ.get("MASTER_PORT", "29500"))
         is_master = (self._rank == 0)
-        store = torch.distributed.TCPStore(
+        self._cached_store = torch.distributed.TCPStore(
             host_name=host,
             port=port,
             world_size=self._world_size,
@@ -340,7 +358,7 @@ class TorchcommsBootstrap(BootstrapProvider):
         logger.info("[torchcomms] Created TCPStore from env vars: "
                     "host=%s, port=%d, is_master=%s",
                     host, port, is_master)
-        return store
+        return self._cached_store
 
     def _ensure_world_comms(self, backend: str) -> None:
         """Create world-level device and CPU comms if not already created."""
@@ -422,6 +440,29 @@ class TorchcommsBootstrap(BootstrapProvider):
                     "TorchComm communicators")
         self._ensure_world_comms(backend)
 
+        # Init torch.distributed for PG compatibility (MoE models,
+        # FlashInfer, SymmMem).  Must happen AFTER _ensure_world_comms
+        # so torchcomms gets the TCPStore port first.  We reuse the
+        # existing TCPStore (wrapped in a PrefixStore) to avoid port
+        # conflicts.
+        if not torch.distributed.is_initialized():
+            store = self._get_store()
+            pg_store = torch.distributed.PrefixStore(
+                "torch_dist", store
+            )
+            # Use gloo for the world PG — it's lightweight (no GPU
+            # resources) and avoids NCCL conflicts with torchcomms.
+            # NCCL sub-groups are created via new_group() below.
+            torch.distributed.init_process_group(
+                backend="gloo",
+                store=pg_store,
+                rank=global_rank,
+                world_size=self._world_size,
+                timeout=self._timeout,
+            )
+            logger.info("[torchcomms] torch.distributed initialized "
+                        "(backend=gloo) for PG compatibility")
+
         split_id = self._split_counter
         self._split_counter += 1
 
@@ -461,7 +502,31 @@ class TorchcommsBootstrap(BootstrapProvider):
                     "name=%s_cpu_split%d, comm=%s",
                     self._group_name, split_id, cpu_sub)
 
-        # 3. Return info with TorchComm objects only (no ProcessGroups).
+        # 3. Create PG sub-groups for compatibility with model code
+        #    that accesses device_group directly (MoE, FlashInfer, etc.).
+        result_device_pg = None
+        result_cpu_pg = None
+        if torch.distributed.is_initialized():
+            from vllm.utils.system_utils import suppress_stdout
+
+            for ranks in group_ranks:
+                # Use gloo for both — these PGs are only for
+                # metadata (.size(), .rank(), symm_mem rendezvous).
+                # Actual collectives go through TorchComm.
+                device_pg = torch.distributed.new_group(
+                    ranks, backend="gloo"
+                )
+                with suppress_stdout():
+                    cpu_pg = torch.distributed.new_group(
+                        ranks, backend="gloo"
+                    )
+                if global_rank in ranks:
+                    result_device_pg = device_pg
+                    result_cpu_pg = cpu_pg
+            logger.info("[torchcomms] PG sub-groups created "
+                        "(device_pg=%s, cpu_pg=%s)",
+                        result_device_pg, result_cpu_pg)
+
         logger.info("[torchcomms] get_bootstrap_info complete for "
                     "global_rank=%d: split_id=%d, "
                     "world_size=%d, rank_in_group=%d",
@@ -472,8 +537,8 @@ class TorchcommsBootstrap(BootstrapProvider):
             ranks=result_ranks,
             world_size=len(result_ranks),
             rank_in_group=result_ranks.index(global_rank),
-            cpu_group=None,
-            device_group=None,
+            cpu_group=result_cpu_pg,
+            device_group=result_device_pg,
             device_comm=device_sub,
             cpu_comm=cpu_sub,
         )
@@ -495,3 +560,6 @@ class TorchcommsBootstrap(BootstrapProvider):
             ctypes.pythonapi.Py_IncRef(
                 ctypes.py_object(self._world_cpu_comm))
             self._world_cpu_comm = None
+        # Tear down torch.distributed if we initialized it.
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()

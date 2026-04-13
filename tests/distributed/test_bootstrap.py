@@ -240,7 +240,10 @@ class TorchcommsBootstrapInitTest(unittest.TestCase):
         self.assertEqual(bootstrap.get_world_size(), -1)
 
     @patch.dict("os.environ", ENV_VARS)
-    def test_init_stores_state(self):
+    @patch("vllm.distributed.bootstrap.torch.distributed.is_initialized",
+           return_value=False)
+    @patch("vllm.distributed.bootstrap.torch.distributed.init_process_group")
+    def test_init_stores_state(self, mock_init_pg, mock_is_init):
         bootstrap = TorchcommsBootstrap()
         bootstrap.init(rank=2, world_size=4, backend="nccl")
         self.assertTrue(bootstrap.is_initialized())
@@ -249,7 +252,10 @@ class TorchcommsBootstrapInitTest(unittest.TestCase):
         self.assertEqual(bootstrap.get_backend(), "nccl")
 
     @patch.dict("os.environ", {}, clear=True)
-    def test_init_populates_env_vars(self):
+    @patch("vllm.distributed.bootstrap.torch.distributed.is_initialized",
+           return_value=False)
+    @patch("vllm.distributed.bootstrap.torch.distributed.init_process_group")
+    def test_init_populates_env_vars(self, mock_init_pg, mock_is_init):
         """init() should set RANK, WORLD_SIZE env vars if not present."""
         bootstrap = TorchcommsBootstrap()
         # Mock cuda to avoid device errors in test env
@@ -263,15 +269,22 @@ class TorchcommsBootstrapInitTest(unittest.TestCase):
         self.assertEqual(os.environ["MASTER_PORT"], "12345")
 
     @patch.dict("os.environ", ENV_VARS)
+    @patch("vllm.distributed.bootstrap.torch.distributed.is_initialized",
+           return_value=False)
     @patch("vllm.distributed.bootstrap.torch.distributed.init_process_group")
-    def test_init_does_not_call_torch_init(self, mock_torch_init):
-        """TorchcommsBootstrap.init() must NOT call init_process_group."""
+    def test_init_calls_torch_init_for_pg_compat(
+        self, mock_torch_init, mock_is_init
+    ):
+        """TorchcommsBootstrap.init() calls init_process_group for PG compat."""
         bootstrap = TorchcommsBootstrap()
         bootstrap.init(rank=0, world_size=4, backend="nccl")
-        mock_torch_init.assert_not_called()
+        mock_torch_init.assert_called_once()
 
     @patch.dict("os.environ", ENV_VARS)
-    def test_destroy_resets_state(self):
+    @patch("vllm.distributed.bootstrap.torch.distributed.is_initialized",
+           return_value=False)
+    @patch("vllm.distributed.bootstrap.torch.distributed.init_process_group")
+    def test_destroy_resets_state(self, mock_init_pg, mock_is_init):
         bootstrap = TorchcommsBootstrap()
         bootstrap.init(rank=0, world_size=4, backend="nccl")
         self.assertTrue(bootstrap.is_initialized())
