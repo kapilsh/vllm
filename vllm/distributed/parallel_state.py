@@ -1211,6 +1211,16 @@ class GroupCoordinator:
             self.device_communicator.destroy()
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
+        # TorchComm sub-comms: prevent their C++ destructor
+        # (ncclCommAbort → blocking thread join) from ever running
+        # by leaking a refcount.  See torchcomm_communicator.py.
+        import ctypes
+        if hasattr(self, "device_comm") and self.device_comm is not None:
+            ctypes.pythonapi.Py_IncRef(ctypes.py_object(self.device_comm))
+            self.device_comm = None
+        if hasattr(self, "cpu_comm") and self.cpu_comm is not None:
+            ctypes.pythonapi.Py_IncRef(ctypes.py_object(self.cpu_comm))
+            self.cpu_comm = None
 
     def prepare_communication_buffer_for_model(self, model: torch.nn.Module):
         if self.device_communicator is not None:

@@ -216,3 +216,14 @@ class TorchCommDeviceCommunicator(DeviceCommunicatorBase):
         if self.ca_comm is not None:
             self.ca_comm.close()
             self.ca_comm = None
+        if self.comm is not None:
+            # TorchCommNCCL's C++ destructor calls ncclCommAbort() which
+            # blocks indefinitely on a thread join waiting for peers.
+            # We cannot let this destructor run — not during orderly
+            # shutdown (blocks until SIGTERM), not during GC, and not
+            # during interpreter teardown.  Prevent it by permanently
+            # incrementing the Python refcount so the destructor never
+            # fires.  The OS reclaims all resources on process exit.
+            import ctypes
+            ctypes.pythonapi.Py_IncRef(ctypes.py_object(self.comm))
+            self.comm = None

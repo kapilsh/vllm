@@ -479,7 +479,19 @@ class TorchcommsBootstrap(BootstrapProvider):
         )
 
     def destroy(self) -> None:
+        import ctypes
+
         logger.info("[torchcomms] Destroying TorchcommsBootstrap")
         self._initialized = False
-        self._world_device_comm = None
-        self._world_cpu_comm = None
+        # TorchCommNCCL's C++ destructor calls ncclCommAbort() which
+        # blocks indefinitely on a thread join waiting for peers.
+        # Prevent the destructor from ever running by permanently
+        # incrementing the refcount.  The OS cleans up on process exit.
+        if self._world_device_comm is not None:
+            ctypes.pythonapi.Py_IncRef(
+                ctypes.py_object(self._world_device_comm))
+            self._world_device_comm = None
+        if self._world_cpu_comm is not None:
+            ctypes.pythonapi.Py_IncRef(
+                ctypes.py_object(self._world_cpu_comm))
+            self._world_cpu_comm = None
