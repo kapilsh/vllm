@@ -5,8 +5,7 @@ from contextlib import contextmanager
 from typing import cast
 
 import torch
-import torch.distributed as dist
-from torch.distributed import ProcessGroup
+from vllm.distributed.dist_backend import dist, ProcessGroup
 
 import vllm.envs as envs
 from vllm import _custom_ops as ops

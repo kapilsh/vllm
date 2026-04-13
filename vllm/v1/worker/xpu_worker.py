@@ -7,6 +7,7 @@ from typing import Any
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed.dist_backend import dist
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.profiler.wrapper import TorchProfilerWrapper
@@ -86,8 +87,9 @@ class XPUWorker(Worker):
         )
 
         # global all_reduce needed for overall oneccl warm up
-        if torch.distributed.is_xccl_available():
-            torch.distributed.all_reduce(torch.zeros(1).xpu())
+        import torch.distributed as _torch_dist
+        if _torch_dist.is_xccl_available():
+            dist.all_reduce(torch.zeros(1).xpu())
 
         # Set random seed.
         set_random_seed(self.model_config.seed)

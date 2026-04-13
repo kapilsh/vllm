@@ -4,8 +4,7 @@
 
 # ===================== import region =====================
 import torch
-import torch.distributed as dist
-from torch.distributed import ProcessGroup, ReduceOp
+from vllm.distributed.dist_backend import dist, ProcessGroup, ReduceOp
 
 import vllm.envs as envs
 from vllm.distributed.device_communicators.pynccl_wrapper import (
@@ -415,9 +414,9 @@ class PyNcclCommunicator:
             stream = current_stream()
         self.group_start()
         for op in p2p_ops:
-            if op.op is torch.distributed.isend:
+            if op.op is dist.isend:
                 self.send(op.tensor, op.group_peer, stream)
-            elif op.op is torch.distributed.irecv:
+            elif op.op is dist.irecv:
                 self.recv(op.tensor, op.group_peer, stream)
 
         self.group_end()

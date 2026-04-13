@@ -8,11 +8,9 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
 import torch
-from torch.distributed import (
-    P2POp,
-    ProcessGroup,
-    batch_isend_irecv,
-)
+from vllm.distributed.dist_backend import P2POp, ProcessGroup, dist
+
+batch_isend_irecv = dist.batch_isend_irecv
 
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.device_communicators.pynccl_wrapper import (
@@ -64,7 +62,7 @@ class TorchDistNcclEplbCommunicator(EplbCommunicator):
     def add_send(self, tensor: torch.Tensor, dst_rank: int) -> None:
         self._p2p_ops.append(
             P2POp(
-                torch.distributed.isend,
+                dist.isend,
                 tensor,
                 dst_rank,
                 self._ep_group,
@@ -74,7 +72,7 @@ class TorchDistNcclEplbCommunicator(EplbCommunicator):
     def add_recv(self, tensor: torch.Tensor, src_rank: int) -> None:
         self._p2p_ops.append(
             P2POp(
-                torch.distributed.irecv,
+                dist.irecv,
                 tensor,
                 src_rank,
                 self._ep_group,
@@ -125,7 +123,7 @@ class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
                     cpu_tensor = tensor.to(device="cpu", non_blocking=True)
                     p2p_ops.append(
                         P2POp(
-                            torch.distributed.isend,
+                            dist.isend,
                             cpu_tensor,
                             peer_rank,
                             self._cpu_group,
@@ -135,7 +133,7 @@ class TorchDistGlooStagedEplbCommunicator(EplbCommunicator):
                 cpu_tensor = torch.empty_like(tensor, device="cpu")
                 p2p_ops.append(
                     P2POp(
-                        torch.distributed.irecv,
+                        dist.irecv,
                         cpu_tensor,
                         peer_rank,
                         self._cpu_group,

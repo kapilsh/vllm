@@ -8,8 +8,7 @@ import random
 import threading
 
 import torch
-import torch.distributed as dist
-from torch.distributed import ProcessGroup
+from vllm.distributed.dist_backend import dist, ProcessGroup
 
 import vllm.envs as envs
 from vllm.config.compilation import PassConfig

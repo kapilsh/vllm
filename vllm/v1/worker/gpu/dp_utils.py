@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
+from vllm.distributed.dist_backend import dist
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import get_dp_group

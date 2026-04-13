@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Literal, overload
 import regex as re
 import torch
 from pydantic import Field, field_validator, model_validator
-from torch.distributed import ProcessGroup, ReduceOp, Store
+from vllm.distributed.dist_backend import dist, ProcessGroup, ReduceOp, Store
 from typing_extensions import Self
 
 import vllm.envs as envs
@@ -190,6 +190,11 @@ class ParallelConfig:
     enable_elastic_ep: bool = False
     """Enable elastic expert parallelism with stateless NCCL groups for DP/EP."""
 
+    use_torchcomms: bool = False
+    """Use torchcomms.distwrap as the distributed backend instead of
+    torch.distributed.  When enabled, all collective operations are routed
+    through torchcomms.  Requires the ``torchcomms`` package to be installed."""
+
     enable_dbo: bool = False
     """Enable dual batch overlap for the model executor."""
     ubatch_size: int = 0
@@ -285,7 +290,7 @@ class ParallelConfig:
 
     distributed_timeout_seconds: int | None = None
     """Timeout in seconds for distributed operations (e.g., init_process_group).
-    If set, this value is passed to torch.distributed.init_process_group as the
+    If set, this value is passed to dist.init_process_group as the
     timeout parameter. If None, PyTorch's default timeout is used (600s for NCCL).
     Increase this for multi-node setups where model downloads may be slow."""
 
@@ -562,7 +567,7 @@ class ParallelConfig:
         # can pick the same (currently free) port through a race
         # condition when calling `get_open_port()`. When the first
         # process binds the port the others will subsequently fail
-        # with `torch.distributed.DistNetworkError: EADDRINUSE`.
+        # with `dist.DistNetworkError: EADDRINUSE`.
         # To make the initialization more robust we retry a few times
         # with a fresh port whenever this specific error is observed.
         from torch.distributed import DistNetworkError
@@ -658,7 +663,7 @@ class ParallelConfig:
         # dp rank 1: has_unfinished_seqs=False
         # aggregated: has_unfinished_seqs=True
         # so this is an OR operation, i.e. MAX in integers
-        torch.distributed.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)
+        dist.all_reduce(tensor, op=ReduceOp.MAX, group=dp_group)
         aggregated_has_unfinished = bool(tensor.item())
         return aggregated_has_unfinished
 
@@ -669,7 +674,7 @@ class ParallelConfig:
         tensor = torch.tensor([kv_cache_memory], dtype=torch.int64, device="cpu")
         # we cannot use broadcast for stateless dp group since it depends
         # on global rank
-        torch.distributed.all_reduce(tensor, op=ReduceOp.MIN, group=dp_group)
+        dist.all_reduce(tensor, op=ReduceOp.MIN, group=dp_group)
         return tensor.item()
 
     def compute_hash(self):
@@ -855,7 +860,7 @@ class ParallelConfig:
         if self.enable_eplb and self.eplb_config.communicator is None:
             if self.enable_elastic_ep:
                 # Elastic EP requires stateless mode
-                # (torch.distributed.batch_isend_irecv doesn't
+                # (dist.batch_isend_irecv doesn't
                 # support stateless mode), so we use PyNCCL backend
                 self.eplb_config.communicator = "pynccl"
             elif self.eplb_config.use_async:

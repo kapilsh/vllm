@@ -4,7 +4,7 @@
 
 import numpy as np
 import torch
-import torch.distributed as dist
+from vllm.distributed.dist_backend import dist
 
 from vllm.config import ParallelConfig
 from vllm.distributed.parallel_state import get_dp_group

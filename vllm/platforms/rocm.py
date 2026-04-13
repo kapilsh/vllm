@@ -8,7 +8,8 @@ from typing import TYPE_CHECKING
 
 import regex as re
 import torch
-from torch.distributed import PrefixStore, ProcessGroup
+from vllm.distributed.dist_backend import dist, ProcessGroup
+from torch.distributed import PrefixStore
 from torch.distributed.distributed_c10d import is_nccl_available
 
 import vllm.envs as envs
@@ -844,7 +845,7 @@ class RocmPlatform(Platform):
             group_rank,
             group_size,
         )
-        from torch.distributed.distributed_c10d import ProcessGroupNCCL
+        from dist.distributed_c10d import ProcessGroupNCCL
 
         backend_options = ProcessGroupNCCL.Options()
         backend_options._timeout = timeout

@@ -18,6 +18,8 @@ import pybase64 as base64
 import pydantic
 import torch
 from fastapi import UploadFile
+
+from vllm.distributed.dist_backend import dist
 from prometheus_client import start_http_server
 from pydantic import Field, TypeAdapter, field_validator, model_validator
 from pydantic_core.core_schema import ValidationInfo
@@ -315,7 +317,7 @@ class BatchProgressTracker:
 
     def pbar(self) -> tqdm:
         enable_tqdm = (
-            not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+            not dist.is_initialized() or dist.get_rank() == 0
         )
         self._pbar = tqdm(
             total=self._total,

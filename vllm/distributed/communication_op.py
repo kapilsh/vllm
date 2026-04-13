@@ -4,7 +4,7 @@
 from typing import Any
 
 import torch
-import torch.distributed
+from vllm.distributed.dist_backend import dist
 
 from .parallel_state import get_tp_group
 
@@ -38,6 +38,6 @@ def tensor_model_parallel_gather(
 def broadcast_tensor_dict(
     tensor_dict: dict[Any, torch.Tensor | Any] | None = None, src: int = 0
 ):
-    if not torch.distributed.is_initialized():
+    if not dist.is_initialized():
         return tensor_dict
     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)

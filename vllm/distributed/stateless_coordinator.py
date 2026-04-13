@@ -5,7 +5,8 @@ import struct
 from typing import Any, Optional
 
 import torch
-from torch.distributed import Backend, ProcessGroup, Store
+from vllm.distributed.dist_backend import dist, ProcessGroup, Store
+from torch.distributed import Backend
 
 from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 from vllm.distributed.parallel_state import (

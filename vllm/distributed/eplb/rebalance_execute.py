@@ -11,7 +11,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from torch.distributed import ProcessGroup, all_gather
+from vllm.distributed.dist_backend import ProcessGroup, dist
+
+all_gather = dist.all_gather
 
 from .eplb_communicator import EplbCommunicator
 
@@ -551,7 +553,7 @@ def rearrange_expert_weights_inplace(
         # Reserve communication buffers via a minimal dummy all_gather on first layer
         for weight, buffer in zip(expert_weights[0], weights_buffer):
             dummy_recv_buffer = [buffer for _ in range(ep_size)]
-            torch.distributed.barrier()
+            dist.barrier()
             all_gather(
                 dummy_recv_buffer,
                 weight,

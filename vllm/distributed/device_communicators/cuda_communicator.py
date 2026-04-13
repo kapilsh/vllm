@@ -3,7 +3,7 @@
 
 
 import torch
-from torch.distributed import ProcessGroup
+from vllm.distributed.dist_backend import dist, ProcessGroup
 
 import vllm.envs as envs
 from vllm.distributed.device_communicators.all_reduce_utils import (
@@ -223,7 +223,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
             out = input_.clone()
-            torch.distributed.all_reduce(out, group=self.device_group)
+            dist.all_reduce(out, group=self.device_group)
             return out
         assert pynccl_comm is not None
         out = pynccl_comm.all_reduce(input_)
@@ -233,7 +233,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             # when we run the model, allreduce only happens for the TP
             # group, where we always have either custom allreduce or pynccl.
             out = input_.clone()
-            torch.distributed.all_reduce(out, group=self.device_group)
+            dist.all_reduce(out, group=self.device_group)
         return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
@@ -306,7 +306,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.send(tensor, dst)
         else:
-            torch.distributed.send(tensor, self.ranks[dst], self.device_group)
+            dist.send(tensor, self.ranks[dst], self.device_group)
 
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: int | None = None
@@ -321,7 +321,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if pynccl_comm is not None and not pynccl_comm.disabled:
             pynccl_comm.recv(tensor, src)
         else:
-            torch.distributed.recv(tensor, self.ranks[src], self.device_group)
+            dist.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:

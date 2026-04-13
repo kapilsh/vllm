@@ -7,7 +7,7 @@ import ray
 import torch
 from ray.exceptions import RayChannelError
 from ray.experimental.channel.communicator import Communicator, TorchTensorAllocator
-from torch.distributed import ReduceOp
+from vllm.distributed.dist_backend import dist, ReduceOp
 
 from vllm.distributed.device_communicators.base_device_communicator import (
     DeviceCommunicatorBase,

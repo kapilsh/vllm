@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
 import numpy as np
 import torch
-import torch.distributed
+from vllm.distributed.dist_backend import dist
 import torch.nn as nn
 from tqdm import tqdm
 
@@ -4373,7 +4373,7 @@ class GPUModelRunner(
         assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
             "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
         )
-        torch.distributed.broadcast(
+        dist.broadcast(
             sampled_token_ids, src=pp.rank, group=pp.device_group
         )
 
@@ -4384,7 +4384,7 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
         recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
-        torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+        dist.broadcast(recv, src=pp.last_rank, group=pp.device_group)
         self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`

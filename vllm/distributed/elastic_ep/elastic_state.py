@@ -6,7 +6,7 @@ import weakref
 from datetime import timedelta
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
-import torch.distributed
+from vllm.distributed.dist_backend import dist
 
 from vllm.config import ParallelConfig
 from vllm.distributed import (
@@ -212,7 +212,7 @@ class ElasticEPScalingState:
             self._execute_tcp_store_barrier(
                 dp_store, group_rank, group_size, barrier_id, timeout=timeout
             )
-            torch.distributed.barrier(dp_group)
+            dist.barrier(dp_group)
             if group_rank == 0:
                 dp_store.delete_key(sync_key)
                 for i in range(group_size):
@@ -328,9 +328,9 @@ class ElasticEPScalingState:
 
         elif state == ScaleUpNewEngineState.PREPARE:
             tensor = torch.tensor([0, 0, 0], dtype=torch.int32, device="cpu")
-            torch.distributed.all_reduce(
+            dist.all_reduce(
                 tensor,
-                op=torch.distributed.ReduceOp.MAX,
+                op=dist.ReduceOp.MAX,
                 group=self.new_dp_group,
             )
             data = tensor.tolist()
@@ -521,8 +521,8 @@ class ElasticEPScalingState:
             dtype=torch.int32,
             device="cpu",
         )
-        torch.distributed.all_reduce(
-            tensor, op=torch.distributed.ReduceOp.MAX, group=new_dp_group
+        dist.all_reduce(
+            tensor, op=dist.ReduceOp.MAX, group=new_dp_group
         )
         data = tensor.tolist()
         self.engine_core.engines_running = bool(data[0])

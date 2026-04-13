@@ -6,7 +6,7 @@
 # Before writing this script, we tried the following approach:
 # 1. We tried to use `cupy`, it calls NCCL correctly, but `cupy` itself
 #  often gets stuck when initializing the NCCL communicator.
-# 2. We tried to use `torch.distributed`, but `torch.distributed.all_reduce`
+# 2. We tried to use `torch.distributed`, but `dist.all_reduce`
 #  contains many other potential cuda APIs, that are not allowed during
 #  capturing the CUDA graph. For further details, please check
 # https://discuss.pytorch.org/t/pytorch-cudagraph-with-nccl-operation-failed/ .
@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from torch.distributed import ReduceOp
+from vllm.distributed.dist_backend import dist, ReduceOp
 
 from vllm import envs
 from vllm.logger import init_logger

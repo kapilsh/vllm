@@ -13,9 +13,8 @@ from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import patch
 
 import torch
-import torch.distributed as dist
+from vllm.distributed.dist_backend import dist, ProcessGroup
 import zmq
-from torch.distributed import ProcessGroup
 from zmq import (  # type: ignore
     IPV6,  # type: ignore
     PUB,

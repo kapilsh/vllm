@@ -4,8 +4,7 @@ import threading
 from weakref import WeakValueDictionary
 
 import torch
-import torch.distributed as dist
-from torch.distributed import ProcessGroup
+from vllm.distributed.dist_backend import dist, ProcessGroup
 
 
 class Cache:
@@ -136,7 +135,7 @@ class DeviceCommunicatorBase:
         self.unique_name = unique_name
 
         # Check if this is a stateless process group
-        from torch.distributed.distributed_c10d import _world
+        from dist.distributed_c10d import _world
 
         is_stateless = _world.pg_map.get(cpu_group, None) is None
 
@@ -238,7 +237,7 @@ class DeviceCommunicatorBase:
         )
 
         # Perform reduce-scatter operation
-        torch.distributed.reduce_scatter_tensor(
+        dist.reduce_scatter_tensor(
             output_tensor, input_tensor, group=self.device_group
         )
 
@@ -272,7 +271,7 @@ class DeviceCommunicatorBase:
         else:
             gather_list = None
         # Gather.
-        torch.distributed.gather(
+        dist.gather(
             input_, gather_list, dst=self.ranks[dst], group=self.device_group
         )
         if self.rank_in_group == dst:
@@ -286,7 +285,7 @@ class DeviceCommunicatorBase:
         """NOTE: `dst` is the local rank of the destination rank."""
         if dst is None:
             dst = (self.rank_in_group + 1) % self.world_size
-        torch.distributed.send(tensor, self.ranks[dst], self.device_group)
+        dist.send(tensor, self.ranks[dst], self.device_group)
 
     def recv(
         self, size: torch.Size, dtype: torch.dtype, src: int | None = None
@@ -297,14 +296,14 @@ class DeviceCommunicatorBase:
             src = (self.rank_in_group - 1) % self.world_size
 
         tensor = torch.empty(size, dtype=dtype, device=self.device)
-        torch.distributed.recv(tensor, self.ranks[src], self.device_group)
+        dist.recv(tensor, self.ranks[src], self.device_group)
         return tensor
 
     def broadcast(self, tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
         """Broadcast a tensor from source rank to all ranks."""
         if self.world_size == 1:
             return tensor
-        torch.distributed.broadcast(tensor, self.ranks[src], self.device_group)
+        dist.broadcast(tensor, self.ranks[src], self.device_group)
         return tensor
 
     def destroy(self):

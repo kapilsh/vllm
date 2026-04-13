@@ -8,7 +8,7 @@ from multiprocessing import Lock
 from typing import Any
 
 import torch
-import torch.distributed as dist
+from vllm.distributed.dist_backend import dist
 
 import vllm.envs as envs
 from vllm.logger import init_logger

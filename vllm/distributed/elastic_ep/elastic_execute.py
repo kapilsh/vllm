@@ -8,7 +8,7 @@ from collections.abc import Iterable, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributed import P2POp
+from vllm.distributed.dist_backend import dist, P2POp
 
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
@@ -75,10 +75,10 @@ def batch_transfer_weights(
     for param in all_params:
         op = object.__new__(P2POp)
         if is_sender:
-            op.op = torch.distributed.isend
+            op.op = dist.isend
             op.tensor = param
         else:
-            op.op = torch.distributed.irecv
+            op.op = dist.irecv
             op.tensor = param
         op.group_peer = peer_rank
         p2p_ops.append(op)

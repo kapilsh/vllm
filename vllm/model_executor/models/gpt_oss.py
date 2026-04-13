@@ -4,7 +4,7 @@ import typing
 from collections.abc import Callable, Iterable
 
 import torch
-import torch.distributed as dist
+from vllm.distributed.dist_backend import dist
 from torch import nn
 from transformers import GptOssConfig
 

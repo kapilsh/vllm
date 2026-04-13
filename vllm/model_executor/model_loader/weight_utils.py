@@ -32,6 +32,7 @@ from vllm import envs
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.distributed import get_tensor_model_parallel_rank, get_world_group
+from vllm.distributed.dist_backend import dist
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
@@ -713,7 +714,7 @@ _BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elap
 
 def enable_tqdm(use_tqdm_on_load: bool):
     return use_tqdm_on_load and (
-        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        not dist.is_initialized() or dist.get_rank() == 0
     )
 
 
@@ -824,9 +825,9 @@ def _prefetch_checkpoint(file_path: str) -> None:
 
 def _prefetch_all_checkpoints(sorted_files: list[str]) -> None:
     """Start prefetching checkpoint files into page cache in a background thread."""
-    if torch.distributed.is_initialized():
-        rank = torch.distributed.get_rank()
-        world_size = torch.distributed.get_world_size()
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
     else:
         rank = 0
         world_size = 1
@@ -1072,7 +1073,7 @@ def runai_safetensors_weights_iterator(
 
 
 def _init_fastsafetensors_loader(
-    pg: "torch.distributed.ProcessGroup",
+    pg: "dist.ProcessGroup",
     device: torch.device,
     f_list: list[str],
     *,
@@ -1090,8 +1091,8 @@ def fastsafetensors_weights_iterator(
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
     using fastsafetensor library."""
-    if torch.distributed.is_initialized():
-        pg = torch.distributed.group.WORLD
+    if dist.is_initialized():
+        pg = dist.group.WORLD
     else:
         pg = SingleGroup()
 

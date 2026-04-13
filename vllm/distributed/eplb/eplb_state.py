@@ -32,7 +32,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from torch.distributed import ProcessGroup, all_reduce
+from vllm.distributed.dist_backend import ProcessGroup, dist
+
+all_reduce = dist.all_reduce
 
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.distributed.parallel_state import (
@@ -1094,7 +1096,7 @@ def _node_count_with_rank_mapping(
     rank_mapping: dict[int, int],
 ) -> int:
     if isinstance(pg, ProcessGroup):
-        world_size = torch.distributed.get_world_size(group=pg)
+        world_size = dist.get_world_size(group=pg)
     else:
         world_size = pg.world_size
 

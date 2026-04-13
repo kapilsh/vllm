@@ -770,7 +770,8 @@ def _encode_layer_name(layer_name: str) -> str | LayerName:
 
 # Supports xccl with PyTorch versions >= 2.8.0.dev for XPU platform
 def supports_xccl() -> bool:
-    return torch.distributed.is_xccl_available()
+    import torch.distributed as _torch_dist
+    return _torch_dist.is_xccl_available()
 
 
 # Supports XPU Graph with PyTorch versions >= 2.11.0.dev for XPU platform

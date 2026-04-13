@@ -9,7 +9,7 @@ import threading
 from typing import TYPE_CHECKING
 
 import torch
-from torch.distributed import ProcessGroup
+from vllm.distributed.dist_backend import dist, ProcessGroup
 
 from vllm.distributed.parallel_state import get_eplb_group
 from vllm.logger import init_logger

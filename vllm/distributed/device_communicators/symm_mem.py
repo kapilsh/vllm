@@ -2,8 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
-import torch.distributed as dist
-from torch.distributed import ProcessGroup
+from vllm.distributed.dist_backend import dist, ProcessGroup
 
 import vllm.envs as envs
 from vllm.distributed.device_communicators.all_reduce_utils import (
@@ -13,7 +12,7 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
 try:
-    import torch.distributed._symmetric_memory as torch_symm_mem
+    import dist._symmetric_memory as torch_symm_mem
 
     symm_mem_available = True
 except ImportError:

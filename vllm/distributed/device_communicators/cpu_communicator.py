@@ -5,7 +5,7 @@ import os
 from typing import Any
 
 import torch
-from torch.distributed import ProcessGroup
+from vllm.distributed.dist_backend import dist, ProcessGroup
 
 from vllm.distributed.utils import pickle
 from vllm.logger import init_logger
@@ -26,7 +26,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
         unique_name: str = "",
     ):
         super().__init__(cpu_group, device, device_group, unique_name)
-        self.dist_module = torch.distributed
+        self.dist_module = dist
 
         if (
             (
@@ -41,7 +41,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
         elif unique_name.startswith("tp") or unique_name.startswith("pp"):
             logger.info(
                 "CPU SHM communicator disabled for group %s: ranks do not share "
-                "the same SHM group name, falling back to torch.distributed.",
+                "the same SHM group name, falling back to dist.",
                 unique_name,
             )
 
@@ -66,7 +66,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
         """
         local_name = _CPUSHMDistributed.make_group_name(self)
         names: list[str] = [""] * self.world_size
-        torch.distributed.all_gather_object(
+        dist.all_gather_object(
             names,
             local_name,
             group=self.device_group,
@@ -234,9 +234,9 @@ class _CPUSHMDistributed:
             [torch.get_num_threads()],
             dtype=torch.int64,
         )
-        torch.distributed.all_reduce(
+        dist.all_reduce(
             thread_num_tensor,
-            op=torch.distributed.ReduceOp.MIN,
+            op=dist.ReduceOp.MIN,
             group=self.communicator.device_group,
         )
         thread_num = thread_num_tensor.item()
@@ -247,12 +247,12 @@ class _CPUSHMDistributed:
             self.communicator.rank,
             thread_num,
         )
-        torch.distributed.barrier(self.communicator.device_group)
+        dist.barrier(self.communicator.device_group)
         torch.ops._C.join_shm_manager(
             handle,
             self.group_name,
         )
-        torch.distributed.barrier(self.communicator.device_group)
+        dist.barrier(self.communicator.device_group)
 
         return handle
 
@@ -273,7 +273,7 @@ class _CPUSHMDistributed:
             self.handle,
             input,
             gather_list,
-            torch.distributed.get_group_rank(group, dst),
+            dist.get_group_rank(group, dst),
         )
 
     def all_gather_into_tensor(

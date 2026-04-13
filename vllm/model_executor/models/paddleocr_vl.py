@@ -532,7 +532,7 @@ class SiglipVisionEmbeddings(nn.Module):
 
 def all_gather_interleave(local_tensor: torch.Tensor, hidden_size: int, tp_size: int):
     """All-gather the input tensor interleavely across model parallel group."""
-    import torch.distributed as dist
+    from vllm.distributed.dist_backend import dist
 
     gathered_tensors = [torch.zeros_like(local_tensor) for _ in range(tp_size)]
     dist.all_gather(

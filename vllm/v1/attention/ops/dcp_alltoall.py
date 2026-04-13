@@ -25,7 +25,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import torch.distributed as dist
+from vllm.distributed.dist_backend import dist
 
 from vllm.triton_utils import tl, triton
 

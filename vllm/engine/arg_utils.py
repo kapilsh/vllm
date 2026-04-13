@@ -439,6 +439,7 @@ class EngineArgs:
     moe_backend: MoEBackend = KernelConfig.moe_backend
     all2all_backend: All2AllBackend = ParallelConfig.all2all_backend
     enable_elastic_ep: bool = ParallelConfig.enable_elastic_ep
+    use_torchcomms: bool = ParallelConfig.use_torchcomms
     enable_dbo: bool = ParallelConfig.enable_dbo
     ubatch_size: int = ParallelConfig.ubatch_size
     dbo_decode_token_threshold: int = ParallelConfig.dbo_decode_token_threshold
@@ -966,6 +967,9 @@ class EngineArgs:
         )
         parallel_group.add_argument(
             "--enable-elastic-ep", **parallel_kwargs["enable_elastic_ep"]
+        )
+        parallel_group.add_argument(
+            "--use-torchcomms", **parallel_kwargs["use_torchcomms"]
         )
         parallel_group.add_argument(
             "--dbo-decode-token-threshold",
@@ -1811,6 +1815,7 @@ class EngineArgs:
             enable_ep_weight_filter=self.enable_ep_weight_filter,
             all2all_backend=self.all2all_backend,
             enable_elastic_ep=self.enable_elastic_ep,
+            use_torchcomms=self.use_torchcomms,
             enable_dbo=self.enable_dbo,
             ubatch_size=self.ubatch_size,
             dbo_decode_token_threshold=self.dbo_decode_token_threshold,

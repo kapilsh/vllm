@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm.distributed.dist_backend import dist
 from vllm.distributed.parallel_state import (
     _init_stateless_group,
     _node_count,
@@ -51,7 +52,7 @@ def create_standby_groups(
 
     from vllm.distributed.utils import get_cached_tcp_store_client
 
-    assert new_world_size_across_dp == torch.distributed.get_world_size() * new_dp_size
+    assert new_world_size_across_dp == dist.get_world_size() * new_dp_size
     world_group = get_world_group()
     assert isinstance(world_group, StatelessGroupCoordinator)
     backend = backend or world_group.backend

@@ -13,7 +13,7 @@ from itertools import product
 from typing import Any
 
 import torch
-import torch.distributed as dist
+from vllm.distributed.dist_backend import dist
 import torch.multiprocessing as mp
 
 import vllm.envs as envs

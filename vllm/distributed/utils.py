@@ -19,7 +19,8 @@ from datetime import timedelta
 from typing import Any
 
 import torch
-from torch.distributed import ProcessGroup, Store, TCPStore
+from vllm.distributed.dist_backend import dist, ProcessGroup, Store
+from torch.distributed import TCPStore
 from torch.distributed.distributed_c10d import (
     Backend,
     PrefixStore,
@@ -282,19 +283,19 @@ class StatelessProcessGroup:
         return tensor
 
     def all_reduce(
-        self, tensor: torch.Tensor, op=torch.distributed.ReduceOp.SUM
+        self, tensor: torch.Tensor, op=dist.ReduceOp.SUM
     ) -> torch.Tensor:
         """All-reduce a tensor across all ranks."""
         tensors = self.all_gather_obj(tensor)
         result = tensors[0].clone()
         for t in tensors[1:]:
-            if op == torch.distributed.ReduceOp.SUM:
+            if op == dist.ReduceOp.SUM:
                 result.add_(t)
-            elif op == torch.distributed.ReduceOp.PRODUCT:
+            elif op == dist.ReduceOp.PRODUCT:
                 result.mul_(t)
-            elif op == torch.distributed.ReduceOp.MAX:
+            elif op == dist.ReduceOp.MAX:
                 result = torch.maximum(result, t)
-            elif op == torch.distributed.ReduceOp.MIN:
+            elif op == dist.ReduceOp.MIN:
                 result = torch.minimum(result, t)
         return result
 
@@ -442,16 +443,16 @@ class StatelessProcessGroup:
         store_timeout: int = 300,
         listen_socket: socket.socket | None = None,
     ) -> "StatelessProcessGroup":
-        """A replacement for `torch.distributed.init_process_group` that does not
+        """A replacement for `dist.init_process_group` that does not
         pollute the global state.
 
-        If we have process A and process B called `torch.distributed.init_process_group`
+        If we have process A and process B called `dist.init_process_group`
         to form a group, and then we want to form another group with process A, B, C,
         D, it is not possible in PyTorch, because process A and process B have already
         formed a group, and process C and process D cannot join that group. This
         function is a workaround for this issue.
 
-        `torch.distributed.init_process_group` is a global call, while this function
+        `dist.init_process_group` is a global call, while this function
         is a stateless call. It will return a `StatelessProcessGroup` object that can be
         used for exchanging metadata. With this function, process A and process B
         can call `StatelessProcessGroup.create` to form a group, and then process A, B,
@@ -507,7 +508,7 @@ def init_gloo_process_group(
             group_rank,
             group_size,
         )
-        from torch.distributed.distributed_c10d import ProcessGroupGloo
+        from dist.distributed_c10d import ProcessGroupGloo
 
         backend_class = ProcessGroupGloo(
             prefix_store, group_rank, group_size, timeout=timeout
@@ -532,7 +533,7 @@ def stateless_init_torch_distributed_process_group(
     listen_socket: socket.socket | None = None,
 ) -> ProcessGroup | tuple[ProcessGroup, Store]:
     """
-    A replacement for `torch.distributed.init_process_group` that does not
+    A replacement for `dist.init_process_group` that does not
     pollute the global state. The created ProcessGroup object can be used for
     some operations such as `allreduce`, because it does not depend on the
     global rank. However, some operations such as `broadcast` cannot be used

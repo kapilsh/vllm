@@ -4,7 +4,7 @@ import threading
 from typing import Any
 
 import torch
-import torch.distributed as dist
+from vllm.distributed.dist_backend import dist
 
 import vllm.envs as envs
 from vllm.distributed import get_dp_group, get_ep_group

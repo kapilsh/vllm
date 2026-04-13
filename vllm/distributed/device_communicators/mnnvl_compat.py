@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
-import torch.distributed as dist
+from vllm.distributed.dist_backend import dist
 from flashinfer.comm.mnnvl import CommBackend as CommBackend
 
 from vllm.utils.flashinfer import has_flashinfer_nvlink_two_sided
