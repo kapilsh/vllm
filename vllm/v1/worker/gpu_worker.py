@@ -21,6 +21,7 @@ from vllm.distributed import (
     ensure_model_parallel_initialized,
     init_distributed_environment,
     set_custom_all_reduce,
+    set_default_bootstrap_provider,
 )
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.eplb.eplb_utils import override_envs_for_eplb
@@ -1032,6 +1033,13 @@ def init_worker_distributed_environment(
     init_batch_invariance(attention_config.backend)
     override_envs_for_eplb(parallel_config)
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
+
+    # Propagate torchcomms bootstrap to worker processes.  The module-level
+    # global set in the main process doesn't survive multiprocessing.spawn,
+    # so we reconstruct it here from the serialised config.
+    if parallel_config.use_torchcomms:
+        from vllm.distributed.bootstrap import TorchcommsBootstrap
+        set_default_bootstrap_provider(TorchcommsBootstrap())
 
     init_method = distributed_init_method or "env://"
 
