@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -1418,6 +1419,12 @@ def init_distributed_environment(
                 "Fallback Gloo backend is not available."
             )
             backend = "gloo"
+        # When TORCH_DISTRIBUTED_USE_TORCHCOMMS=1, the TorchComm C++ backend
+        # reads rank/world_size from env vars instead of using the kwargs
+        # passed to init_process_group.
+        if os.environ.get("TORCH_DISTRIBUTED_USE_TORCHCOMMS") == "1":
+            os.environ["TORCHCOMM_RANK"] = str(rank)
+            os.environ["TORCHCOMM_SIZE"] = str(world_size)
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,
