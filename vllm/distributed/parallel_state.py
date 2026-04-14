@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -40,6 +41,14 @@ import torch
 import torch.distributed._functional_collectives as funcol
 import torch.distributed._symmetric_memory
 from torch.distributed import Backend, Store
+
+# Save direct references to torch.distributed functions before torchcomms'
+# _block_torch_distributed_collectives() patches them with mock.patch.
+# These are needed for gloo CPU groups that torchcomms doesn't manage.
+import torch.distributed as _torch_dist
+_torch_dist_barrier = _torch_dist.barrier
+_torch_dist_broadcast_object_list = _torch_dist.broadcast_object_list
+_torch_dist_all_reduce = _torch_dist.all_reduce
 
 from vllm.distributed.dist_backend import (
     TORCHCOMMS_AVAILABLE,
@@ -1475,13 +1484,24 @@ def init_distributed_environment(
             )
         init_kwargs: dict[str, Any] = dict(
             backend=backend,
-            init_method=distributed_init_method,
             world_size=world_size,
             rank=rank,
             timeout=timeout,
         )
         if use_torchcomms:
             init_kwargs["use_torchcomms"] = True
+            # torchcomms needs MASTER_ADDR/MASTER_PORT/RANK/WORLD_SIZE
+            # env vars for new_comm(). vLLM doesn't use torchrun, so
+            # extract them from distributed_init_method and set them.
+            if distributed_init_method and distributed_init_method.startswith("tcp://"):
+                addr_port = distributed_init_method[len("tcp://"):]
+                host, port = addr_port.rsplit(":", 1)
+                os.environ.setdefault("MASTER_ADDR", host)
+                os.environ.setdefault("MASTER_PORT", port)
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(world_size)
+        else:
+            init_kwargs["init_method"] = distributed_init_method
         dist.init_process_group(**init_kwargs)
         if use_torchcomms:
             logger.info(
@@ -2041,7 +2061,10 @@ def in_the_same_node_as(
                 assert shm.buf is not None, "Buffer was not created"
                 shm.buf[: len(magic_message)] = magic_message
                 if isinstance(pg, ProcessGroup):
-                    dist.broadcast_object_list(
+                    # Use saved reference — torchcomms blocks
+                    # torch.distributed calls but doesn't manage
+                    # gloo-only PGs.
+                    _torch_dist_broadcast_object_list(
                         [shm.name], src=ranks[source_rank], group=pg
                     )
                 else:
@@ -2051,7 +2074,7 @@ def in_the_same_node_as(
                 # try to open the shared memory segment
                 if isinstance(pg, ProcessGroup):
                     recv = [None]
-                    dist.broadcast_object_list(
+                    _torch_dist_broadcast_object_list(
                         recv, src=ranks[source_rank], group=pg
                     )
                     name = recv[0]
@@ -2075,7 +2098,7 @@ def in_the_same_node_as(
             shm.close()
 
     if isinstance(pg, ProcessGroup):
-        dist.barrier(group=pg)
+        _torch_dist_barrier(group=pg)
     else:
         pg.barrier()
 
@@ -2085,7 +2108,7 @@ def in_the_same_node_as(
             shm.unlink()
 
     if isinstance(pg, ProcessGroup):
-        dist.all_reduce(is_in_the_same_node, group=pg)
+        _torch_dist_all_reduce(is_in_the_same_node, group=pg)
         aggregated_data = is_in_the_same_node
     else:
         aggregated_data = torch.zeros_like(is_in_the_same_node)
