@@ -25,6 +25,7 @@ If you only need to use the distributed environment without model/pipeline
 
 import contextlib
 import gc
+import os
 import pickle
 import weakref
 from collections import namedtuple
@@ -335,20 +336,73 @@ class GroupCoordinator:
         self_device_group = None
         self_cpu_group = None
 
-        for ranks in group_ranks:
-            device_group = torch.distributed.new_group(
-                ranks, backend=torch_distributed_backend
+        use_torchcomms_shim = (
+            os.environ.get("TORCH_DISTRIBUTED_USE_TORCHCOMMS") == "1"
+        )
+
+        if use_torchcomms_shim:
+            # torchcomms shim: new_group + torchcomms calls new_comm()
+            # which is a world-wide collective — non-member ranks
+            # return early causing a hang.
+            #
+            # Strategy depends on whether subgroups exist:
+            # - World-sized (all ranks in one group): new_group works
+            #   because all ranks participate in new_comm.
+            # - Non-world-sized subgroups: use split_group which is a
+            #   collective on the parent comm (all ranks participate).
+            #   split_group PGs only have NCCL backend, so we reuse
+            #   them as cpu_group too (single-rank groups don't need
+            #   CPU coordination).
+            world_size_total = torch.distributed.get_world_size()
+            is_world_sized = all(
+                len(r) == world_size_total for r in group_ranks
             )
-            # a group with `gloo` backend, to allow direct coordination between
-            # processes through the CPU.
-            with suppress_stdout():
-                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
-            if self.rank in ranks:
-                self.ranks = ranks
-                self.world_size = len(ranks)
-                self.rank_in_group = ranks.index(self.rank)
-                self_device_group = device_group
-                self_cpu_group = cpu_group
+
+            if is_world_sized:
+                # All ranks in every group — new_group is safe.
+                for ranks in group_ranks:
+                    device_group = torch.distributed.new_group(
+                        ranks, backend=torch_distributed_backend
+                    )
+                    with suppress_stdout():
+                        cpu_group = torch.distributed.new_group(
+                            ranks, backend="gloo"
+                        )
+                    if self.rank in ranks:
+                        self.ranks = ranks
+                        self.world_size = len(ranks)
+                        self.rank_in_group = ranks.index(self.rank)
+                        self_device_group = device_group
+                        self_cpu_group = cpu_group
+            else:
+                split_pg = torch.distributed.split_group(
+                    split_ranks=group_ranks,
+                )
+                self_device_group = split_pg
+                self_cpu_group = split_pg
+                for ranks in group_ranks:
+                    if self.rank in ranks:
+                        self.ranks = ranks
+                        self.world_size = len(ranks)
+                        self.rank_in_group = ranks.index(self.rank)
+                        break
+        else:
+            for ranks in group_ranks:
+                device_group = torch.distributed.new_group(
+                    ranks, backend=torch_distributed_backend
+                )
+                # a group with `gloo` backend, to allow direct coordination
+                # between processes through the CPU.
+                with suppress_stdout():
+                    cpu_group = torch.distributed.new_group(
+                        ranks, backend="gloo"
+                    )
+                if self.rank in ranks:
+                    self.ranks = ranks
+                    self.world_size = len(ranks)
+                    self.rank_in_group = ranks.index(self.rank)
+                    self_device_group = device_group
+                    self_cpu_group = cpu_group
 
         assert self_cpu_group is not None
         assert self_device_group is not None
@@ -1053,11 +1107,20 @@ class GroupCoordinator:
         return self.device_communicator.recv(size, dtype, src)
 
     def destroy(self):
+        # With torchcomms shim, PyTorch's destroy_process_group calls
+        # _world.comms.clear() which drops ALL comm references, not
+        # just the destroyed PG's. This causes double-finalize when
+        # destroying subsequent PGs. Skip individual PG destroys and
+        # let the global destroy_process_group() in
+        # destroy_distributed_environment handle cleanup.
+        if os.environ.get("TORCH_DISTRIBUTED_USE_TORCHCOMMS") != "1":
+            if hasattr(self, "device_group"):
+                torch.distributed.destroy_process_group(self.device_group)
+            if hasattr(self, "cpu_group"):
+                torch.distributed.destroy_process_group(self.cpu_group)
         if hasattr(self, "device_group"):
-            torch.distributed.destroy_process_group(self.device_group)
             del self.device_group
         if hasattr(self, "cpu_group"):
-            torch.distributed.destroy_process_group(self.cpu_group)
             del self.cpu_group
         if self.device_communicator is not None:
             self.device_communicator.destroy()
@@ -1418,6 +1481,26 @@ def init_distributed_environment(
                 "Fallback Gloo backend is not available."
             )
             backend = "gloo"
+        # When using PyTorch's native torchcomms shim
+        # (TORCH_DISTRIBUTED_USE_TORCHCOMMS=1), torchcomms.new_comm()
+        # reads rank/size from env vars rather than from the
+        # init_process_group kwargs. vLLM spawns workers via
+        # multiprocessing.spawn (not torchrun), so these env vars
+        # aren't set automatically. Set them here so the shim works.
+        if os.environ.get("TORCH_DISTRIBUTED_USE_TORCHCOMMS") == "1":
+            os.environ["RANK"] = str(rank)
+            os.environ["WORLD_SIZE"] = str(world_size)
+            os.environ["LOCAL_RANK"] = str(local_rank)
+            # torchcomms StoreManager also reads MASTER_ADDR/PORT
+            # for bootstrapping subgroup comms (new_group calls).
+            # vLLM uses tcp:// init_method, so extract from there.
+            if (distributed_init_method
+                    and distributed_init_method.startswith("tcp://")):
+                addr_port = distributed_init_method[len("tcp://"):]
+                host, port_str = addr_port.rsplit(":", 1)
+                os.environ.setdefault("MASTER_ADDR", host)
+                os.environ.setdefault("MASTER_PORT", port_str)
+
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,
@@ -1944,9 +2027,14 @@ def in_the_same_node_as(
     memory system (shared access to shared memory).
     """
     if isinstance(pg, ProcessGroup):
-        assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
-            "in_the_same_node_as should be tested with a non-NCCL group."
-        )
+        # With the torchcomms shim, split_group PGs report as NCCL
+        # but can handle CPU ops via the torchcomms wrapper, so skip
+        # this assertion.
+        if os.environ.get("TORCH_DISTRIBUTED_USE_TORCHCOMMS") != "1":
+            assert (
+                torch.distributed.get_backend(pg)
+                != torch.distributed.Backend.NCCL
+            ), "in_the_same_node_as should be tested with a non-NCCL group."
         # local rank inside the group
         rank = torch.distributed.get_rank(group=pg)
         world_size = torch.distributed.get_world_size(group=pg)
