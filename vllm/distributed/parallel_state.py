@@ -1468,7 +1468,7 @@ def init_distributed_environment(
         if use_torchcomms:
             logger.info(
                 "Initializing distributed environment with torchcomms "
-                "distwrap backend (backend=%s, world_size=%d, rank=%d)",
+                "backend (backend=%s, world_size=%d, rank=%d)",
                 backend,
                 world_size,
                 rank,
@@ -1505,7 +1505,7 @@ def init_distributed_environment(
         dist.init_process_group(**init_kwargs)
         if use_torchcomms:
             logger.info(
-                "torchcomms distwrap backend initialized successfully. "
+                "torchcomms backend initialized successfully. "
                 "All collectives will be routed through torchcomms."
             )
         if enable_elastic_ep:

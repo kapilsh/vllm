@@ -44,7 +44,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self._use_torchcomms = is_torchcomms_enabled()
         if self._use_torchcomms:
             logger.info(
-                "torchcomms distwrap is active for group %s — "
+                "torchcomms is active for group %s — "
                 "all collectives will route through torchcomms "
                 "(PyNCCL/CustomAR/SymmMem/FlashInfer bypassed).",
                 unique_name,
@@ -186,7 +186,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
 
     def all_reduce(self, input_):
-        # When torchcomms is active, route directly through distwrap.
+        # When torchcomms is active, route directly through torchcomms.
         if self._use_torchcomms:
             out = input_.clone()
             dist.all_reduce(out, group=self.device_group)

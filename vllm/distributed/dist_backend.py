@@ -3,10 +3,9 @@
 """
 Drop-in distributed backend shim.
 
-When torchcomms is installed, this module re-exports from
-``torchcomms.distwrap`` — a compatibility layer that provides the same
-API as ``torch.distributed`` but can optionally route collectives through
-the torchcomms backend (enabled via
+When torchcomms is installed, this module re-exports from its compatibility
+layer which provides the same API as ``torch.distributed`` but can optionally
+route collectives through the torchcomms backend (enabled via
 ``init_process_group(use_torchcomms=True)``).
 
 When torchcomms is **not** installed, everything falls back to plain
@@ -30,7 +29,7 @@ try:
 
     TORCHCOMMS_AVAILABLE = True
     logger.info(
-        "torchcomms is available (distwrap backend loaded). "
+        "torchcomms is available. "
         "Use --use-torchcomms to enable torchcomms routing."
     )
 except ImportError:
@@ -43,9 +42,9 @@ except ImportError:
 
 
 class _DistProxy(types.ModuleType):
-    """Module proxy that forwards to distwrap when available, else torch.distributed.
+    """Module proxy that forwards to torchcomms when available, else torch.distributed.
 
-    For attributes that distwrap doesn't explicitly define (e.g. ``get_backend``,
+    For attributes that torchcomms doesn't explicitly define (e.g. ``get_backend``,
     ``is_backend_available``), the proxy falls through to ``torch.distributed``.
     """
 
@@ -65,7 +64,7 @@ dist: types.ModuleType = _DistProxy() if TORCHCOMMS_AVAILABLE else _torch_dist
 
 # Re-export commonly used symbols so callers can write:
 #   from vllm.distributed.dist_backend import dist, ProcessGroup
-# These are identical objects on both torch.distributed and distwrap.
+# These are identical objects on both torch.distributed and torchcomms.
 ProcessGroup = _torch_dist.ProcessGroup
 ReduceOp = _torch_dist.ReduceOp
 Store = _torch_dist.Store

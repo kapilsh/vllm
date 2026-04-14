@@ -23,6 +23,7 @@ from vllm.distributed.device_communicators.pynccl_wrapper import (
     ncclComm_t,
     ncclDataTypeEnum,
 )
+from vllm.distributed.dist_backend import is_torchcomms_enabled
 from vllm.distributed.kv_transfer.kv_connector.v1.p2p.tensor_memory_pool import (  # noqa: E501
     TensorMemoryPool,
 )
@@ -64,6 +65,61 @@ def set_p2p_nccl_context(num_channels: str):
                 os.environ.pop(var, None)
 
 
+def _create_p2p_torchcomms_pg(host, port, rank, device, group_desc):
+    """Create a standalone torchcomms-registered PG for a P2P KV transfer pair.
+
+    Creates a world_size=2 NCCL process group and registers it with
+    the torchcomms PG registry so that ``dist.send``/``dist.recv`` route
+    through torchcomms.
+    """
+    from torch.distributed import TCPStore
+
+    from vllm.distributed.utils import (
+        stateless_init_torch_distributed_process_group,
+    )
+
+    pg = stateless_init_torch_distributed_process_group(
+        host=host,
+        port=port,
+        rank=rank,
+        world_size=2,
+        backend="nccl",
+        group_name=group_desc,
+    )
+
+    # Register with torchcomms so collectives route correctly
+    try:
+        from torchcomms.distwrap.pginfo import pg_info_create, pg_info_set_data
+
+        pg_info_create(pg, [0, 1], group_desc)
+        pg_info_set_data(pg, "device_backends", {"cuda": "nccl"})
+
+        # Create a TorchComm instance for this pairwise group
+        store = TCPStore(
+            host_name=host,
+            port=port + 10000,  # offset to avoid conflict with PG store
+            world_size=2,
+            is_master=(rank == 0),
+            wait_for_workers=True,
+        )
+        from torchcomms._comms import new_comm
+
+        tc = new_comm(
+            backend="nccl",
+            device=device,
+            store=store,
+            name=group_desc,
+        )
+        pg_info_set_data(pg, "torchcomms", {"cuda": tc})
+    except ImportError:
+        logger.warning(
+            "torchcomms not available for KV transfer PG %s",
+            group_desc,
+        )
+
+    return pg
+
+
 @dataclass
 class SendQueueItem:
     tensor_id: str
@@ -84,6 +140,7 @@ class P2pNcclEngine:
         self.rank = port_offset
         self.local_rank = local_rank
         self.device = torch.device(f"cuda:{self.local_rank}")
+        self._use_torchcomms = is_torchcomms_enabled()
         self.nccl = NCCLLibrary(library_path)
 
         if not hostname:
@@ -214,21 +271,48 @@ class P2pNcclEngine:
                 )
                 return sock, self.comms[remote_address]
 
-            unique_id = self.nccl.ncclGetUniqueId()
-            data = {"cmd": "NEW", "unique_id": bytes(unique_id.internal)}
-            sock.send(msgpack.dumps(data))
+            if self._use_torchcomms:
+                # Torchcomms path: create a standalone PG for this pair
+                from vllm.utils.network_utils import get_open_port
 
-            with torch.accelerator.device_index(self.device.index):
-                rank = 0
-                with set_p2p_nccl_context(self.nccl_num_channels):
-                    comm: ncclComm_t = self.nccl.ncclCommInitRank(2, unique_id, rank)
-                self.comms[remote_address] = (comm, rank)
+                store_port = get_open_port()
+                data = {
+                    "cmd": "NEW",
+                    "store_host": self._hostname,
+                    "store_port": store_port,
+                }
+                sock.send(msgpack.dumps(data))
+                pg = _create_p2p_torchcomms_pg(
+                    host=self._hostname,
+                    port=store_port,
+                    rank=0,
+                    device=self.device,
+                    group_desc=f"kv_p2p_{self.zmq_address}_{remote_address}",
+                )
+                self.comms[remote_address] = (pg, 0)
                 logger.info(
-                    "🤝ncclCommInitRank Success, %s👉%s, MyRank:%s",
+                    "🤝torchcomms PG created, %s👉%s, MyRank:0",
                     self.zmq_address,
                     remote_address,
-                    rank,
                 )
+            else:
+                unique_id = self.nccl.ncclGetUniqueId()
+                data = {"cmd": "NEW", "unique_id": bytes(unique_id.internal)}
+                sock.send(msgpack.dumps(data))
+
+                with torch.accelerator.device_index(self.device.index):
+                    rank = 0
+                    with set_p2p_nccl_context(self.nccl_num_channels):
+                        comm: ncclComm_t = self.nccl.ncclCommInitRank(
+                            2, unique_id, rank
+                        )
+                    self.comms[remote_address] = (comm, rank)
+                    logger.info(
+                        "🤝ncclCommInitRank Success, %s👉%s, MyRank:%s",
+                        self.zmq_address,
+                        remote_address,
+                        rank,
+                    )
 
         return self.socks[remote_address], self.comms[remote_address]
 
@@ -376,20 +460,43 @@ class P2pNcclEngine:
             remote_address, message = self.router_socket.recv_multipart()
             data = msgpack.loads(message)
             if data["cmd"] == "NEW":
-                unique_id = self.nccl.unique_id_from_bytes(bytes(data["unique_id"]))
-                with torch.accelerator.device_index(self.device.index):
-                    rank = 1
-                    with set_p2p_nccl_context(self.nccl_num_channels):
-                        comm: ncclComm_t = self.nccl.ncclCommInitRank(
-                            2, unique_id, rank
-                        )
-                    self.comms[remote_address.decode()] = (comm, rank)
+                if self._use_torchcomms:
+                    # Torchcomms path: connect to the initiator's TCPStore
+                    store_host = data["store_host"]
+                    store_port = data["store_port"]
+                    pg = _create_p2p_torchcomms_pg(
+                        host=store_host,
+                        port=store_port,
+                        rank=1,
+                        device=self.device,
+                        group_desc=(
+                            f"kv_p2p_{remote_address.decode()}"
+                            f"_{self.zmq_address}"
+                        ),
+                    )
+                    self.comms[remote_address.decode()] = (pg, 1)
                     logger.info(
-                        "🤝ncclCommInitRank Success, %s👈%s, MyRank:%s",
+                        "🤝torchcomms PG created, %s👈%s, MyRank:1",
                         self.zmq_address,
                         remote_address.decode(),
-                        rank,
                     )
+                else:
+                    unique_id = self.nccl.unique_id_from_bytes(
+                        bytes(data["unique_id"])
+                    )
+                    with torch.accelerator.device_index(self.device.index):
+                        rank = 1
+                        with set_p2p_nccl_context(self.nccl_num_channels):
+                            comm: ncclComm_t = self.nccl.ncclCommInitRank(
+                                2, unique_id, rank
+                            )
+                        self.comms[remote_address.decode()] = (comm, rank)
+                        logger.info(
+                            "🤝ncclCommInitRank Success, %s👈%s, MyRank:%s",
+                            self.zmq_address,
+                            remote_address.decode(),
+                            rank,
+                        )
             elif data["cmd"] == "PUT":
                 tensor_id = data["tensor_id"]
                 try:
@@ -591,6 +698,13 @@ class P2pNcclEngine:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
+        if self._use_torchcomms:
+            # comm is a ProcessGroup when using torchcomms
+            from vllm.distributed.dist_backend import dist
+
+            dist.send(tensor, dst=dst, group=comm)
+            return
+
         if stream is None:
             stream = current_stream()
 
@@ -610,6 +724,13 @@ class P2pNcclEngine:
             f"this nccl communicator is created to work on {self.device}, "
             f"but the input tensor is on {tensor.device}"
         )
+        if self._use_torchcomms:
+            # comm is a ProcessGroup when using torchcomms
+            from vllm.distributed.dist_backend import dist
+
+            dist.recv(tensor, src=src, group=comm)
+            return
+
         if stream is None:
             stream = current_stream()
 

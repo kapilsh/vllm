@@ -324,12 +324,25 @@ class NCCLWeightTransferEngine(
         master_address, master_port, rank, world_size, device
     ):
         """
-        vLLM provides `StatelessProcessGroup` to create a process group
-        without considering the global process group in torch.distributed.
-        It is recommended to create `StatelessProcessGroup`, and then initialize
-        the data-plane communication (NCCL) between external (train processes)
-        and vLLM workers.
+        Create a communication group for weight transfer.
+
+        When torchcomms is enabled, creates a torchcomms-backed process group.
+        Otherwise, uses the original
+        StatelessProcessGroup + PyNcclCommunicator (raw NCCL) path.
+
+        The returned object is duck-typed with a `.broadcast(tensor, src=0)`
+        method, compatible with both packed_tensor.py and direct usage.
         """
+        from vllm.distributed.dist_backend import (
+            TORCHCOMMS_AVAILABLE,
+            is_torchcomms_enabled,
+        )
+
+        if is_torchcomms_enabled() and TORCHCOMMS_AVAILABLE:
+            return _create_torchcomms_weight_transfer_group(
+                master_address, master_port, rank, world_size, device
+            )
+
         from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
         from vllm.distributed.utils import StatelessProcessGroup
 
@@ -338,3 +351,99 @@ class NCCLWeightTransferEngine(
         )
         pynccl = PyNcclCommunicator(pg, device=device)
         return pynccl
+
+
+def _create_torchcomms_weight_transfer_group(
+    master_address, master_port, rank, world_size, device
+):
+    """Create a torchcomms-backed group for weight transfer.
+
+    Creates a standalone torch.distributed ProcessGroup (NCCL backend) via
+    stateless init and registers it with the torchcomms PG registry so that
+    ``dist.broadcast()`` routes through torchcomms.
+    """
+    import torch
+    from torch.distributed import TCPStore
+
+    from vllm.distributed.dist_backend import dist
+    from vllm.distributed.utils import (
+        stateless_init_torch_distributed_process_group,
+    )
+    from vllm.logger import init_logger
+
+    logger = init_logger(__name__)
+
+    # Create a standalone NCCL process group
+    pg = stateless_init_torch_distributed_process_group(
+        host=master_address,
+        port=master_port,
+        rank=rank,
+        world_size=world_size,
+        backend="nccl",
+        group_name=f"weight_transfer_{rank}",
+        return_store=False,
+    )
+
+    # Register with torchcomms PG registry so collectives route through
+    # torchcomms instead of being blocked.
+    try:
+        from torchcomms.distwrap.pginfo import pg_info_create, pg_info_set_data
+        from torchcomms.distwrap.utils import torchcomms_is_enabled
+
+        if torchcomms_is_enabled():
+            ranks = list(range(world_size))
+            pg_info_create(pg, ranks, "weight_transfer")
+            pg_info_set_data(pg, "device_backends", {"cuda": "nccl"})
+
+            # Create a TorchComm instance for this standalone group
+            store = TCPStore(
+                host_name=master_address,
+                port=master_port + 1000,  # offset to avoid conflict
+                world_size=world_size,
+                is_master=(rank == 0),
+                wait_for_workers=True,
+            )
+            from torchcomms._comms import new_comm
+
+            tc = new_comm(
+                backend="nccl",
+                device=torch.device(f"cuda:{device}"),
+                store=store,
+                name="weight_transfer",
+            )
+            pg_info_set_data(pg, "torchcomms", {"cuda": tc})
+            logger.info(
+                "Weight transfer group created with torchcomms "
+                "(rank=%d, world_size=%d)",
+                rank,
+                world_size,
+            )
+    except ImportError:
+        logger.warning(
+            "torchcomms pginfo not available — weight transfer PG not "
+            "registered with torchcomms. Collectives may be blocked."
+        )
+
+    return _TorchcommsWeightTransferGroup(pg, device, rank)
+
+
+class _TorchcommsWeightTransferGroup:
+    """Duck-type compatible with PyNcclCommunicator for weight transfer.
+
+    Wraps a torch.distributed ProcessGroup and routes broadcast calls
+    through the dist_backend shim (→ torchcomms).
+    """
+
+    def __init__(self, pg, device, rank):
+        from vllm.distributed.dist_backend import dist
+
+        self._pg = pg
+        self._dist = dist
+        self.device = device
+        self.rank = rank
+
+    def broadcast(self, tensor, src=0, stream=None):
+        """Broadcast tensor from src rank. Stream arg is accepted for
+        compatibility with PyNcclCommunicator but not used — torchcomms
+        uses the current CUDA stream automatically."""
+        self._dist.broadcast(tensor, src=src, group=self._pg)
