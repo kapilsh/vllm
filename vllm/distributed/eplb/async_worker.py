@@ -9,11 +9,11 @@ import threading
 from typing import TYPE_CHECKING
 
 import torch
-from torch.distributed import ProcessGroup
 
 from vllm.distributed.parallel_state import get_eplb_group
 from vllm.logger import init_logger
 
+from .eplb_communicator import EplbGroupContext, create_eplb_group_context
 from .rebalance_execute import transfer_layer
 
 if TYPE_CHECKING:
@@ -26,8 +26,8 @@ def start_async_worker(
     state: "EplbState",
     is_profile: bool = False,
 ) -> threading.Thread:
-    eplb_group = get_eplb_group().device_group
-    rank = eplb_group.rank()
+    eplb_ctx = create_eplb_group_context(get_eplb_group())
+    rank = eplb_ctx.rank
     device_index = state.cuda_device_index
     assert state.is_async
 
@@ -41,7 +41,7 @@ def start_async_worker(
             loop.run_until_complete(
                 transfer_run_periodically(
                     state=state,
-                    eplb_group=eplb_group,
+                    eplb_ctx=eplb_ctx,
                     cuda_stream=cuda_stream,
                     is_profile=is_profile,
                 )
@@ -88,7 +88,7 @@ def run_rebalance_experts(
 
 async def transfer_run_periodically(
     state: "EplbState",
-    eplb_group: ProcessGroup,
+    eplb_ctx: EplbGroupContext,
     cuda_stream: torch.cuda.Stream,
     is_profile: bool = False,
 ) -> None:
@@ -158,7 +158,7 @@ async def transfer_run_periodically(
                             new_layer_indices=new_layer_indices,
                             expert_weights=model_state.model.expert_weights[layer_idx],
                             expert_weights_buffer=model_state.expert_buffer,
-                            ep_group=eplb_group,
+                            ep_ctx=eplb_ctx,
                             communicator=model_state.communicator,
                             is_profile=is_profile,
                             cuda_stream=cuda_stream,

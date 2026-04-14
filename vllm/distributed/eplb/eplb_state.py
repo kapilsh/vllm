@@ -32,7 +32,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-from torch.distributed import ProcessGroup, all_reduce
+from torch.distributed import ProcessGroup
 
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.distributed.parallel_state import (
@@ -47,7 +47,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import MixtureOfExperts
 
 from .async_worker import start_async_worker
-from .eplb_communicator import EplbCommunicator, create_eplb_communicator
+from .eplb_communicator import (
+    EplbCommunicator,
+    EplbGroupContext,
+    create_eplb_communicator,
+    create_eplb_group_context,
+)
 from .policy import EPLB_POLICIES, AbstractEplbPolicy, DefaultEplbPolicy
 from .rebalance_execute import (
     RecvMetadata,
@@ -541,7 +546,7 @@ class EplbState:
             - `max_tokens`: The maximum load across ranks.
             - `balancedness`: The ratio of average load to maximum load.
         """
-        ep_group = get_ep_group().device_group
+        ep_ctx = create_eplb_group_context(get_ep_group())
         if is_profile:
             self.rearrange(is_profile=True)
             return
@@ -560,14 +565,13 @@ class EplbState:
             # Sync the expert load pass for each model (main and drafter).
             # expert_load_pass: (num_moe_layers, num_physical_experts)
             expert_load_pass_list = self._sync_load_pass()
-            ep_group = get_ep_group().device_group
             for expert_load_pass, eplb_model_state in zip(
                 expert_load_pass_list, self.model_states.values()
             ):
                 # num_tokens_per_rank: (num_moe_layers, num_ranks)
                 num_tokens_per_rank = (
                     expert_load_pass.reshape(
-                        expert_load_pass.shape[0], ep_group.size(), -1
+                        expert_load_pass.shape[0], ep_ctx.size, -1
                     )
                     .sum(dim=-1)
                     .float()
@@ -586,7 +590,7 @@ class EplbState:
                 avg_tokens, max_tokens = tokens_tensors
                 balancedness = avg_tokens / max_tokens if max_tokens > 0 else 0.0
 
-                if ep_group.rank() == 0:
+                if ep_ctx.rank == 0:
                     logger.info(
                         "EPLB step: %d for model %s: avg_tokens=%.2f, "
                         "max_tokens=%d, balancedness=%.4f, "
@@ -631,7 +635,7 @@ class EplbState:
                 if eplb_model_state.ep_buffer_ready and all_ranks_buffer_ready:
                     self.move_to_workspace(
                         model_state=eplb_model_state,
-                        ep_group=ep_group,
+                        ep_ctx=ep_ctx,
                         is_profile=is_profile,
                     )
 
@@ -716,8 +720,8 @@ class EplbState:
                 when scaling is done in EEP.
         """
 
-        ep_group = get_ep_group().device_group
-        ep_rank = ep_group.rank()
+        ep_ctx = create_eplb_group_context(get_ep_group())
+        ep_rank = ep_ctx.rank
 
         start_event = None
         end_event = None
@@ -768,7 +772,7 @@ class EplbState:
         num_replicas = model.num_physical_experts
         num_groups = model.num_expert_groups
 
-        if rank_mapping is not None and len(rank_mapping) == ep_group.size():
+        if rank_mapping is not None and len(rank_mapping) == ep_ctx.size:
             # NOTE(yongji): scale down, we need to rebalance the experts on
             # remaining GPUs, transfer the experts while we haven't shutdown
             # the GPUs to be released.
@@ -778,11 +782,11 @@ class EplbState:
             num_nodes = _node_count_with_rank_mapping(tcp_store_group, rank_mapping)
             num_gpus = sum(new_rank != -1 for new_rank in rank_mapping.values())
             num_replicas = (
-                num_replicas // ep_group.size() * num_gpus
+                num_replicas // ep_ctx.size * num_gpus
             )  # handle num replicas change
         else:
             num_nodes = get_node_count()
-            num_gpus = ep_group.size()
+            num_gpus = ep_ctx.size
 
         if num_gpus % num_nodes != 0:
             num_nodes = 1
@@ -812,7 +816,7 @@ class EplbState:
                     eplb_model_state.physical_to_logical_map,
                     new_physical_to_logical_map,
                     eplb_model_state.model.expert_weights,
-                    ep_group,
+                    ep_ctx,
                     eplb_model_state.communicator,
                     is_profile,
                     rank_mapping,
@@ -874,32 +878,24 @@ class EplbState:
             )
 
     def _all_ranks_buffer_ready(self, model_state: EplbModelState) -> bool:
-        parallel_state = get_ep_group()
-        cpu_group = getattr(parallel_state, "cpu_group", None)
-        if cpu_group is not None and cpu_group.size() > 1:
-            flag = torch.tensor(
-                (int(model_state.ep_buffer_ready),), dtype=torch.int32, device="cpu"
-            )
-            all_reduce(flag, group=cpu_group)
-            return int(flag.item()) == cpu_group.size()
-
-        device_group = parallel_state.device_group
-        if device_group.size() <= 1:
+        ep_ctx = create_eplb_group_context(get_ep_group())
+        if ep_ctx.size <= 1:
             return bool(model_state.ep_buffer_ready)
 
+        parallel_state = get_ep_group()
         device = getattr(
             parallel_state, "device", model_state.physical_to_logical_map.device
         )
         flag = torch.tensor(
             (int(model_state.ep_buffer_ready),), dtype=torch.int32, device=device
         )
-        all_reduce(flag, group=device_group)
-        return int(flag.item()) == device_group.size()
+        ep_ctx.all_reduce_sum(flag)
+        return int(flag.item()) == ep_ctx.size
 
     def move_to_workspace(
         self,
         model_state: EplbModelState,
-        ep_group: ProcessGroup,
+        ep_ctx: EplbGroupContext,
         is_profile: bool = False,
     ):
         # We call move_to_workspace only when ep_buffer_ready is 1.
@@ -910,12 +906,12 @@ class EplbState:
             retries += 1
             if retries >= max_retries:
                 raise RuntimeError(
-                    f"Rank {ep_group.rank()}: buffer_lock timeout after "
+                    f"Rank {ep_ctx.rank}: buffer_lock timeout after "
                     "{max_retries * 10}s"
                 )
             logger.warning(
                 "Rank %d: EPLB buffer_lock acquire failed, retrying (%d/%d)",
-                ep_group.rank(),
+                ep_ctx.rank,
                 retries,
                 max_retries,
             )
@@ -935,7 +931,7 @@ class EplbState:
                 is_received_locally=model_state.is_received_locally,
                 recv_metadata=model_state.recv_metadata,
                 new_indices=new_indices,
-                ep_rank=ep_group.rank(),
+                ep_rank=ep_ctx.rank,
             )
 
             transferred_layer = model_state.layer_to_transfer
@@ -970,7 +966,7 @@ class EplbState:
                 logger.info(
                     "finish async transfer for model %s rank %d layer %d",
                     model_state.model_name,
-                    ep_group.rank(),
+                    ep_ctx.rank,
                     model_state.model.num_moe_layers,
                 )
 
@@ -980,7 +976,7 @@ class EplbState:
             except Exception as e:
                 logger.error(
                     "Rank %d: buffer_lock release failed in move_to_workspace: %s",
-                    ep_group.rank(),
+                    ep_ctx.rank,
                     str(e),
                 )
 
@@ -992,8 +988,9 @@ class EplbState:
         """
         All-reduce a list of tensors.
         """
+        ep_ctx = create_eplb_group_context(get_ep_group())
         if len(tensor_list) == 1:
-            all_reduce(tensor_list[0], group=get_ep_group().device_group)
+            ep_ctx.all_reduce_sum(tensor_list[0])
             return tensor_list
         assert all(t.dim() == 2 for t in tensor_list), "All tensors must be 2D."
         assert all(t.shape[1] == tensor_list[0].shape[1] for t in tensor_list), (
@@ -1005,8 +1002,7 @@ class EplbState:
         shapes = [t.shape for t in tensor_list]
         concat_tensor = torch.cat(tensor_list, dim=0)
 
-        ep_group = get_ep_group().device_group
-        all_reduce(concat_tensor, group=ep_group)
+        ep_ctx.all_reduce_sum(concat_tensor)
 
         all_reduce_list = []
         offset = 0

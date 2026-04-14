@@ -1204,11 +1204,13 @@ def _test_body_eplb(
     )
 
     # Rearrange expert weights across EP ranks
+    from vllm.distributed.eplb.eplb_communicator import ProcessGroupEplbContext
+
     rearrange_expert_weights_inplace(
         old_global_expert_indices=initial_indices.unsqueeze(0),
         new_global_expert_indices=shuffled_indices.unsqueeze(0),
         expert_weights=expert_weights,
-        ep_group=cpu_group,
+        ep_ctx=ProcessGroupEplbContext(cpu_group),
         communicator=communicator,
     )
 

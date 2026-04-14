@@ -194,7 +194,8 @@ def _test_eplb_fml(env, world_size: int, test_config: TestConfig):
             tensor_model_parallel_size=world_size, pipeline_model_parallel_size=1
         )
 
-        ep_group = get_tp_group().cpu_group
+        from vllm.distributed.eplb.eplb_communicator import create_eplb_group_context
+        ep_ctx = create_eplb_group_context(get_tp_group())
         ep_rank = torch.distributed.get_rank()
 
         fml_layers = [
@@ -217,7 +218,7 @@ def _test_eplb_fml(env, world_size: int, test_config: TestConfig):
             indices,
             shuffled_indices,
             rank_expert_weights,
-            ep_group,
+            ep_ctx,
             is_profile=False,
         )
 

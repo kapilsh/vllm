@@ -4,9 +4,13 @@
 
 import numpy as np
 import torch
-import torch.distributed as dist
 
 from vllm.config import ParallelConfig
+from vllm.distributed.eplb.eplb_communicator import (
+    EplbGroupContext,
+    ProcessGroupEplbContext,
+    TorchCommEplbContext,
+)
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.logger import init_logger
 from vllm.v1.worker.ubatch_utils import (
@@ -17,23 +21,33 @@ from vllm.v1.worker.ubatch_utils import (
 logger = init_logger(__name__)
 
 
-def _get_device_and_group(parallel_config: ParallelConfig):
-    # Use the actual device assigned to the DP group, not just the device type
-    device = get_dp_group().device
-    group = get_dp_group().device_group
+def _get_device_and_ctx(
+    parallel_config: ParallelConfig,
+) -> tuple[torch.device | str, EplbGroupContext]:
+    dp = get_dp_group()
+    use_cpu = parallel_config.disable_nccl_for_dp_synchronization
 
-    # Transferring this tensor from GPU to CPU will introduce a GPU sync
-    # point that could adversely affect performance of vllm with asynch
-    # scheduling. This environment variable exists to quickly disable
-    # this optimization if we run into this case.
-    if parallel_config.disable_nccl_for_dp_synchronization:
+    if use_cpu:
         logger.info_once(
             "Using CPU all reduce to synchronize DP padding between ranks.",
             scope="local",
         )
-        device = "cpu"
-        group = get_dp_group().cpu_group
-    return device, group
+
+    if dp.cpu_comm is not None:
+        # TorchComm path — cpu_comm handles both CPU and device tensors
+        return ("cpu" if use_cpu else dp.device,
+                TorchCommEplbContext(
+                    device_comm=dp.cpu_comm if use_cpu else dp.device_comm,
+                    rank=dp.rank_in_group,
+                    size=dp.world_size,
+                ))
+
+    # ProcessGroup path
+    if use_cpu:
+        assert dp.cpu_group is not None
+        return "cpu", ProcessGroupEplbContext(dp.cpu_group)
+    assert dp.device_group is not None
+    return dp.device, ProcessGroupEplbContext(dp.device_group)
 
 
 def _run_ar(
@@ -45,13 +59,13 @@ def _run_ar(
 ) -> torch.Tensor:
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
-    device, group = _get_device_and_group(parallel_config)
+    device, ctx = _get_device_and_ctx(parallel_config)
     tensor = torch.zeros(4, dp_size, device=device, dtype=torch.int32)
     tensor[0][dp_rank] = orig_num_tokens_per_ubatch
     tensor[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor[2][dp_rank] = 1 if should_ubatch else 0
     tensor[3][dp_rank] = cudagraph_mode
-    dist.all_reduce(tensor, group=group)
+    ctx.all_reduce_sum(tensor)
     return tensor
 
 
