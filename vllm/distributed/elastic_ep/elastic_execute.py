@@ -192,6 +192,7 @@ class ElasticEPScalingExecutor:
                 master_ip=reconfig_request.new_data_parallel_master_ip,
                 coord_store_port=reconfig_request.coord_store_port,
                 enable_eplb=updated_config.parallel_config.enable_eplb,
+                use_torchcomms=updated_config.parallel_config.use_torchcomms,
             )
         if new_dp_size > old_dp_size:
             self._set_eplb_suppressed(True)
