@@ -339,11 +339,16 @@ def send_recv_test_worker(
     "test_target",
     [all_reduce_test_worker, all_gather_test_worker, broadcast_tensor_dict_test_worker],
 )
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
 def test_multi_process_tensor_parallel(
     monkeypatch: pytest.MonkeyPatch,
     tp_size: int,
     test_target: Callable[..., Any],
+    use_torchcomms: bool,
 ):
+    if use_torchcomms:
+        monkeypatch.setenv("VLLM_DISTRIBUTED_USE_TORCHCOMMS", "1")
     multi_process_parallel(monkeypatch, tp_size, 1, test_target)
 
 
@@ -352,11 +357,16 @@ def test_multi_process_tensor_parallel(
 @pytest.mark.parametrize(
     "test_target", [send_recv_test_worker, send_recv_tensor_dict_test_worker]
 )
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
 def test_multi_process_pipeline_parallel(
     monkeypatch: pytest.MonkeyPatch,
     pp_size: int,
     test_target: Callable[..., Any],
+    use_torchcomms: bool,
 ):
+    if use_torchcomms:
+        monkeypatch.setenv("VLLM_DISTRIBUTED_USE_TORCHCOMMS", "1")
     multi_process_parallel(monkeypatch, 1, pp_size, test_target)
 
 
@@ -373,10 +383,15 @@ def test_multi_process_pipeline_parallel(
         broadcast_tensor_dict_test_worker,
     ],
 )
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
 def test_multi_process_tensor_parallel_pipeline_parallel(
     tp_size: int,
     pp_size: int,
     test_target: Callable[..., Any],
     monkeypatch: pytest.MonkeyPatch,
+    use_torchcomms: bool,
 ):
+    if use_torchcomms:
+        monkeypatch.setenv("VLLM_DISTRIBUTED_USE_TORCHCOMMS", "1")
     multi_process_parallel(monkeypatch, tp_size, pp_size, test_target)

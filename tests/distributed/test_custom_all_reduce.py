@@ -120,13 +120,18 @@ def eager_allreduce(
 @pytest.mark.parametrize("tp_size", [2])
 @pytest.mark.parametrize("pipeline_parallel_size", [1, 2])
 @pytest.mark.parametrize("test_target", [eager_allreduce, graph_allreduce])
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
 def test_custom_allreduce(
     monkeypatch: pytest.MonkeyPatch,
     tp_size,
     pipeline_parallel_size,
     test_target,
+    use_torchcomms,
 ):
     world_size = tp_size * pipeline_parallel_size
     if world_size > torch.accelerator.device_count():
         pytest.skip("Not enough GPUs to run the test.")
+    if use_torchcomms:
+        monkeypatch.setenv("VLLM_DISTRIBUTED_USE_TORCHCOMMS", "1")
     multi_process_parallel(monkeypatch, tp_size, pipeline_parallel_size, test_target)

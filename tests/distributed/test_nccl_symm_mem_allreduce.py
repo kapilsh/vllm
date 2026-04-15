@@ -32,7 +32,9 @@ random.seed(44)
 test_size_elements = 4 * 1024 * 1024
 
 
-def nccl_symm_mem_allreduce_worker(local_rank: int, world_size: int):
+def nccl_symm_mem_allreduce_worker(
+    local_rank: int, world_size: int, use_torchcomms: bool = False,
+):
     monkeypatch = pytest.MonkeyPatch()
     with monkeypatch.context() as m:
         m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
@@ -41,15 +43,16 @@ def nccl_symm_mem_allreduce_worker(local_rank: int, world_size: int):
         torch.accelerator.set_device_index(device)
         torch.set_default_device(device)
         torch.set_default_dtype(dtype)
-        update_environment_variables(
-            {
-                "RANK": str(local_rank),
-                "LOCAL_RANK": str(local_rank),
-                "WORLD_SIZE": str(world_size),
-                "MASTER_ADDR": "localhost",
-                "MASTER_PORT": "12345",
-            }
-        )
+        env = {
+            "RANK": str(local_rank),
+            "LOCAL_RANK": str(local_rank),
+            "WORLD_SIZE": str(world_size),
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": "12345",
+        }
+        if use_torchcomms:
+            env["VLLM_DISTRIBUTED_USE_TORCHCOMMS"] = "1"
+        update_environment_variables(env)
 
         init_distributed_environment()
         with ensure_current_vllm_config():
@@ -82,8 +85,11 @@ def nccl_symm_mem_allreduce_worker(local_rank: int, world_size: int):
     reason="NCCLSymmMemAllreduce is only available for CUDA platforms.",
 )
 @pytest.mark.parametrize("world_size", [2])
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
 @pytest.mark.skipif(envs.VLLM_TARGET_DEVICE not in ["cuda"], reason="Only test on CUDA")
-def test_nccl_symm_mem_allreduce(monkeypatch: pytest.MonkeyPatch, world_size):
+def test_nccl_symm_mem_allreduce(monkeypatch: pytest.MonkeyPatch, world_size,
+                                  use_torchcomms):
     if world_size > torch.accelerator.device_count():
         pytest.skip("Not enough GPUs to run the test.")
 
@@ -92,5 +98,6 @@ def test_nccl_symm_mem_allreduce(monkeypatch: pytest.MonkeyPatch, world_size):
     monkeypatch.setenv("NCCL_NVLS_ENABLE", "1")
     monkeypatch.setenv("NCCL_CUMEM_ENABLE", "1")
 
-    mp.spawn(nccl_symm_mem_allreduce_worker, args=(world_size,), nprocs=world_size)
+    mp.spawn(nccl_symm_mem_allreduce_worker,
+             args=(world_size, use_torchcomms), nprocs=world_size)
     cleanup_dist_env_and_memory()

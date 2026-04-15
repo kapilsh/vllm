@@ -47,18 +47,6 @@ def _create_workspace(
     group: ProcessGroup,
 ):
     """Create a flashinfer allreduce workspace, returning None on failure."""
-    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
-    if _use_torchcomms_enabled():
-        # FlashInfer's trtllm backend opens its own TCP socket for IPC
-        # buffer exchange inside create_allreduce_fusion_workspace.
-        # This conflicts with vLLM's multiprocessing.spawn workers —
-        # one rank may fail to connect while the other blocks on a
-        # collective, causing an asymmetric deadlock.
-        logger.info_once(
-            "FlashInfer allreduce disabled: incompatible with "
-            "torchcomms shim (trtllm socket IPC conflict)."
-        )
-        return None
     comm_backend = TorchDistBackend(group=group)
     rng_state = random.getstate()
     try:

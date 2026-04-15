@@ -28,7 +28,7 @@ def _distributed_worker_wrapper(fn, env, world_size, args, rank, skip_queue):
         raise
 
 
-def distributed_run(fn, world_size, *args):
+def distributed_run(fn, world_size, *args, use_torchcomms=False):
     number_of_processes = world_size
     processes: list[mp.Process] = []
     skip_queue: mp.SimpleQueue = mp.SimpleQueue()
@@ -40,6 +40,8 @@ def distributed_run(fn, world_size, *args):
         env["LOCAL_WORLD_SIZE"] = str(number_of_processes)
         env["MASTER_ADDR"] = "localhost"
         env["MASTER_PORT"] = "12345"
+        if use_torchcomms:
+            env["VLLM_DISTRIBUTED_USE_TORCHCOMMS"] = "1"
         p = mp.Process(
             target=_distributed_worker_wrapper,
             args=(fn, env, world_size, args, i, skip_queue),

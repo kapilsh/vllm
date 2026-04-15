@@ -528,12 +528,15 @@ def _test_rearrange_expert_weights_with_redundancy(
     ],
 )
 @pytest.mark.parametrize("eplb_communicator", ["torch_nccl", "torch_gloo", "pynccl"])
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
 def test_rearrange_expert_weights_with_redundancy(
     world_size,
     num_layers,
     num_local_experts,
     num_logical_experts,
     eplb_communicator,
+    use_torchcomms,
 ):
     """Test the functionality of rearranging expert weights with redundancy."""
 
@@ -546,6 +549,7 @@ def test_rearrange_expert_weights_with_redundancy(
         num_local_experts,
         num_logical_experts,
         eplb_communicator,
+        use_torchcomms=use_torchcomms,
     )
 
 
@@ -634,12 +638,15 @@ def _test_rearrange_expert_weights_no_change(env, world_size) -> None:
     ],
 )
 @pytest.mark.parametrize("eplb_communicator", ["torch_nccl", "torch_gloo", "pynccl"])
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
 def test_async_transfer_layer_without_mtp(
     world_size: int,
     num_layers: int,
     num_local_experts: int,
     num_logical_experts: int,
     eplb_communicator: str,
+    use_torchcomms: bool,
 ):
     """Exercise async EPLB transfer path without MTP/spec decode."""
 
@@ -653,11 +660,14 @@ def test_async_transfer_layer_without_mtp(
         num_local_experts,
         num_logical_experts,
         eplb_communicator,
+        use_torchcomms=use_torchcomms,
     )
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_rearrange_expert_weights_no_change(world_size):
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
+def test_rearrange_expert_weights_no_change(world_size, use_torchcomms):
     """
     Test that when the indices do not change, the weights should remain
     unchanged.
@@ -668,6 +678,7 @@ def test_rearrange_expert_weights_no_change(world_size):
     distributed_run(
         _test_rearrange_expert_weights_no_change,
         world_size,
+        use_torchcomms=use_torchcomms,
     )
 
 
@@ -757,7 +768,9 @@ def _test_rearrange_expert_weights_profile_mode(env, world_size) -> None:
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
-def test_rearrange_expert_weights_profile_mode(world_size):
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
+def test_rearrange_expert_weights_profile_mode(world_size, use_torchcomms):
     """Test profile mode (should not copy actual weights)"""
 
     if torch.accelerator.device_count() < world_size:
@@ -765,4 +778,5 @@ def test_rearrange_expert_weights_profile_mode(world_size):
     distributed_run(
         _test_rearrange_expert_weights_profile_mode,
         world_size,
+        use_torchcomms=use_torchcomms,
     )

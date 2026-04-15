@@ -31,9 +31,15 @@ random.seed(44)
 test_size_elements = 1024 * 1024
 
 
-def symm_mem_allreduce_worker(local_rank: int, world_size: int, q: mp.Queue):
+def symm_mem_allreduce_worker(
+    local_rank: int, world_size: int, q: mp.Queue,
+    use_torchcomms: bool = False,
+):
     monkeypatch = pytest.MonkeyPatch()
-    config = VllmConfig(parallel_config=ParallelConfig(tensor_parallel_size=world_size))
+    config = VllmConfig(parallel_config=ParallelConfig(
+        tensor_parallel_size=world_size,
+        use_torchcomms=use_torchcomms,
+    ))
 
     with monkeypatch.context() as m, set_current_vllm_config(config):
         m.delenv("CUDA_VISIBLE_DEVICES", raising=False)
@@ -100,15 +106,19 @@ def symm_mem_allreduce_worker(local_rank: int, world_size: int, q: mp.Queue):
 )
 @pytest.mark.parametrize("tp_size", [2])
 @pytest.mark.parametrize("pipeline_parallel_size", [1])
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
 @pytest.mark.skipif(envs.VLLM_TARGET_DEVICE not in ["cuda"], reason="Only test on CUDA")
 def test_symm_mem_allreduce(
-    monkeypatch: pytest.MonkeyPatch, tp_size, pipeline_parallel_size
+    monkeypatch: pytest.MonkeyPatch, tp_size, pipeline_parallel_size,
+    use_torchcomms,
 ):
     world_size = tp_size * pipeline_parallel_size
     if world_size > torch.accelerator.device_count():
         pytest.skip("Not enough GPUs to run the test.")
     q = mp.get_context("spawn").Queue()
-    mp.spawn(symm_mem_allreduce_worker, args=(world_size, q), nprocs=world_size)
+    mp.spawn(symm_mem_allreduce_worker,
+             args=(world_size, q, use_torchcomms), nprocs=world_size)
     try:
         val = q.get(timeout=1)
     except queue.Empty:
