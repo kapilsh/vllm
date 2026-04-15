@@ -42,6 +42,7 @@ import torch.distributed
 import torch.distributed._functional_collectives as funcol
 import torch.distributed._symmetric_memory
 from torch.distributed import Backend, ProcessGroup, Store
+from torch.distributed.distributed_c10d import _use_torchcomms_enabled
 
 import vllm.envs as envs
 from vllm.distributed.device_communicators.base_device_communicator import (
@@ -336,9 +337,7 @@ class GroupCoordinator:
         self_device_group = None
         self_cpu_group = None
 
-        use_torchcomms_shim = (
-            os.environ.get("TORCH_DISTRIBUTED_USE_TORCHCOMMS") == "1"
-        )
+        use_torchcomms_shim = _use_torchcomms_enabled()
 
         if use_torchcomms_shim:
             # torchcomms shim: new_group + torchcomms calls new_comm()
@@ -1113,7 +1112,7 @@ class GroupCoordinator:
         # destroying subsequent PGs. Skip individual PG destroys and
         # let the global destroy_process_group() in
         # destroy_distributed_environment handle cleanup.
-        if os.environ.get("TORCH_DISTRIBUTED_USE_TORCHCOMMS") != "1":
+        if not _use_torchcomms_enabled():
             if hasattr(self, "device_group"):
                 torch.distributed.destroy_process_group(self.device_group)
             if hasattr(self, "cpu_group"):
@@ -1488,6 +1487,13 @@ def init_distributed_environment(
         # multiprocessing.spawn (not torchrun), so these env vars
         # aren't set automatically. Set them here so the shim works.
         if os.environ.get("TORCH_DISTRIBUTED_USE_TORCHCOMMS") == "1":
+            # Force the config flag in case torch.distributed was
+            # imported before the env var was set in this process.
+            # Config reads env_name_default only at import time.
+            import torch.distributed.config as _tc_cfg
+            _tc_cfg.use_torchcomms = True
+
+        if _use_torchcomms_enabled():
             os.environ["RANK"] = str(rank)
             os.environ["WORLD_SIZE"] = str(world_size)
             os.environ["LOCAL_RANK"] = str(local_rank)
@@ -1979,7 +1985,16 @@ def destroy_distributed_environment():
     _WORLD = None
     _NODE_COUNT = None
     if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
+        if _use_torchcomms_enabled():
+            # With torchcomms shim, destroy_process_group() calls
+            # comm.finalize() → ncclCommDestroy → blocking thread
+            # join that deadlocks at process exit. Skip the global
+            # destroy entirely — leak the comms and let the OS
+            # reclaim resources on process exit (same pattern as
+            # the bootstrap-provider branch).
+            pass
+        else:
+            torch.distributed.destroy_process_group()
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
@@ -2030,7 +2045,7 @@ def in_the_same_node_as(
         # With the torchcomms shim, split_group PGs report as NCCL
         # but can handle CPU ops via the torchcomms wrapper, so skip
         # this assertion.
-        if os.environ.get("TORCH_DISTRIBUTED_USE_TORCHCOMMS") != "1":
+        if not _use_torchcomms_enabled():
             assert (
                 torch.distributed.get_backend(pg)
                 != torch.distributed.Backend.NCCL
