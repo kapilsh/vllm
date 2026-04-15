@@ -1426,6 +1426,15 @@ def init_distributed_environment(
     from vllm.config import get_current_vllm_config_or_none
 
     config = get_current_vllm_config_or_none()
+
+    # Activate torchcomms shim if ParallelConfig requests it.
+    # Must happen before init_process_group.
+    if (config is not None
+            and config.parallel_config.use_torchcomms
+            and not _use_torchcomms_enabled()):
+        import torch.distributed.config as _tc_cfg
+        _tc_cfg.use_torchcomms = True
+
     enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
     if (
         config is not None
@@ -1485,12 +1494,19 @@ def init_distributed_environment(
         # via multiprocessing.spawn (not torchrun), so these env
         # vars aren't set automatically.
         if _use_torchcomms_enabled():
-            os.environ["RANK"] = str(rank)
-            os.environ["WORLD_SIZE"] = str(world_size)
-            os.environ["LOCAL_RANK"] = str(local_rank)
+            # torchcomms.new_comm() reads rank/size from env vars
+            # rather than from init_process_group kwargs. vLLM spawns
+            # workers via multiprocessing.spawn (not torchrun), so
+            # these may not be set.
+            if rank >= 0:
+                os.environ["RANK"] = str(rank)
+            if world_size >= 0:
+                os.environ["WORLD_SIZE"] = str(world_size)
+            if local_rank >= 0:
+                os.environ["LOCAL_RANK"] = str(local_rank)
             # torchcomms StoreManager also reads MASTER_ADDR/PORT
             # for bootstrapping subgroup comms (new_group calls).
-            # vLLM uses tcp:// init_method, so extract from there.
+            # Extract from tcp:// init_method if available.
             if (distributed_init_method
                     and distributed_init_method.startswith("tcp://")):
                 addr_port = distributed_init_method[len("tcp://"):]

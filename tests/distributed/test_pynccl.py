@@ -24,7 +24,7 @@ from vllm.utils.system_utils import update_environment_variables
 mp.set_start_method("spawn", force=True)
 
 
-def distributed_run(fn, world_size):
+def distributed_run(fn, world_size, use_torchcomms=False):
     number_of_processes = world_size
     processes: list[mp.Process] = []
     for i in range(number_of_processes):
@@ -35,6 +35,8 @@ def distributed_run(fn, world_size):
         env["LOCAL_WORLD_SIZE"] = str(number_of_processes)
         env["MASTER_ADDR"] = "localhost"
         env["MASTER_PORT"] = "12345"
+        if use_torchcomms:
+            env["VLLM_DISTRIBUTED_USE_TORCHCOMMS"] = "1"
         p = mp.Process(target=fn, args=(env,))
         processes.append(p)
         p.start()
@@ -55,8 +57,9 @@ def worker_fn_wrapper(fn):
         local_rank = os.environ["LOCAL_RANK"]
         device = torch.device(f"cuda:{local_rank}")
         torch.accelerator.set_device_index(device)
-        init_distributed_environment()
-        fn()
+        with ensure_current_vllm_config():
+            init_distributed_environment()
+            fn()
 
     return wrapped_fn
 
@@ -75,8 +78,9 @@ def worker_fn():
 @pytest.mark.skipif(
     torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
 )
-def test_pynccl():
-    distributed_run(worker_fn, 2)
+@pytest.mark.parametrize("use_torchcomms", [False, True])
+def test_pynccl(use_torchcomms):
+    distributed_run(worker_fn, 2, use_torchcomms=use_torchcomms)
 
 
 @worker_fn_wrapper
