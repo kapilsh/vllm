@@ -1033,6 +1033,13 @@ def init_worker_distributed_environment(
     override_envs_for_eplb(parallel_config)
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
 
+    # Activate torchcomms shim if configured. Must happen before
+    # init_distributed_environment calls init_process_group.
+    if parallel_config.use_torchcomms:
+        import torch.distributed.config as _tc_cfg
+        _tc_cfg.use_torchcomms = True
+        os.environ["TORCH_DISTRIBUTED_USE_TORCHCOMMS"] = "1"
+
     init_method = distributed_init_method or "env://"
 
     timeout = None

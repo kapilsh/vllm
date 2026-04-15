@@ -187,6 +187,13 @@ class ParallelConfig:
     disable_custom_all_reduce: bool = False
     """Disable the custom all-reduce kernel and fall back to NCCL."""
 
+    use_torchcomms: bool = False
+    """Use PyTorch's torchcomms shim for distributed communication.
+    When enabled, all process group backends (NCCL, Gloo) are
+    automatically wrapped by torchcomms. Can also be enabled via the
+    VLLM_DISTRIBUTED_USE_TORCHCOMMS=1 or
+    TORCH_DISTRIBUTED_USE_TORCHCOMMS=1 environment variables."""
+
     enable_elastic_ep: bool = False
     """Enable elastic expert parallelism with stateless NCCL groups for DP/EP."""
 
@@ -720,6 +727,10 @@ class ParallelConfig:
         return hash_factors(factors)
 
     def __post_init__(self) -> None:
+        # Pick up torchcomms from env vars if not set explicitly
+        if not self.use_torchcomms:
+            self.use_torchcomms = envs.VLLM_DISTRIBUTED_USE_TORCHCOMMS
+
         # Continue with the rest of the initialization
         self.world_size = (
             self.pipeline_parallel_size

@@ -107,6 +107,7 @@ if TYPE_CHECKING:
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
+    VLLM_DISTRIBUTED_USE_TORCHCOMMS: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_ROCM_USE_AITER: bool = False
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
@@ -964,6 +965,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
         os.getenv("VLLM_DISABLE_PYNCCL", "False").lower() in ("true", "1")
+    ),
+    # Use PyTorch's torchcomms shim for all distributed communication.
+    # Also enabled when TORCH_DISTRIBUTED_USE_TORCHCOMMS=1 is set.
+    "VLLM_DISTRIBUTED_USE_TORCHCOMMS": lambda: (
+        os.getenv("VLLM_DISTRIBUTED_USE_TORCHCOMMS", "False").lower()
+        in ("true", "1")
+        or os.getenv("TORCH_DISTRIBUTED_USE_TORCHCOMMS", "False").lower()
+        in ("true", "1")
     ),
     # Optional: enable external Oink custom ops (e.g., Blackwell RMSNorm).
     # Disabled by default.

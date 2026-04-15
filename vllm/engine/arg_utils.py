@@ -491,6 +491,7 @@ class EngineArgs:
     allow_deprecated_quantization: bool = ModelConfig.allow_deprecated_quantization
     enforce_eager: bool = ModelConfig.enforce_eager
     disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
+    use_torchcomms: bool = ParallelConfig.use_torchcomms
     language_model_only: bool = MultiModalConfig.language_model_only
     limit_mm_per_prompt: dict[str, int | dict[str, int]] = get_field(
         MultiModalConfig, "limit_per_prompt"
@@ -1821,6 +1822,7 @@ class EngineArgs:
             expert_placement_strategy=self.expert_placement_strategy,
             max_parallel_loading_workers=self.max_parallel_loading_workers,
             disable_custom_all_reduce=self.disable_custom_all_reduce,
+            use_torchcomms=self.use_torchcomms,
             ray_workers_use_nsight=self.ray_workers_use_nsight,
             ray_runtime_env=ray_runtime_env,
             placement_group=placement_group,

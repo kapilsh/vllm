@@ -1480,19 +1480,10 @@ def init_distributed_environment(
                 "Fallback Gloo backend is not available."
             )
             backend = "gloo"
-        # When using PyTorch's native torchcomms shim
-        # (TORCH_DISTRIBUTED_USE_TORCHCOMMS=1), torchcomms.new_comm()
-        # reads rank/size from env vars rather than from the
-        # init_process_group kwargs. vLLM spawns workers via
-        # multiprocessing.spawn (not torchrun), so these env vars
-        # aren't set automatically. Set them here so the shim works.
-        if os.environ.get("TORCH_DISTRIBUTED_USE_TORCHCOMMS") == "1":
-            # Force the config flag in case torch.distributed was
-            # imported before the env var was set in this process.
-            # Config reads env_name_default only at import time.
-            import torch.distributed.config as _tc_cfg
-            _tc_cfg.use_torchcomms = True
-
+        # torchcomms.new_comm() reads rank/size from env vars rather
+        # than from init_process_group kwargs. vLLM spawns workers
+        # via multiprocessing.spawn (not torchrun), so these env
+        # vars aren't set automatically.
         if _use_torchcomms_enabled():
             os.environ["RANK"] = str(rank)
             os.environ["WORLD_SIZE"] = str(world_size)
