@@ -266,15 +266,24 @@ class DeviceCommunicatorBase:
             # Convert negative dim to positive.
             dim += input_.dim()
 
-        # Allocate output tensor.
-        if self.rank_in_group == dst:
+        from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+        if _use_torchcomms_enabled():
+            # torch.distributed.gather passes [] as output_tensors for
+            # non-root ranks, but _BackendWrapper requires exactly one
+            # output tensor list. Call the backend directly instead.
             gather_list = [torch.empty_like(input_) for _ in range(world_size)]
+            backend = self.device_group._get_backend(input_.device)
+            work = backend.gather(gather_list, input_, dst)
+            work.wait()
         else:
-            gather_list = None
-        # Gather.
-        torch.distributed.gather(
-            input_, gather_list, dst=self.ranks[dst], group=self.device_group
-        )
+            if self.rank_in_group == dst:
+                gather_list = [torch.empty_like(input_) for _ in range(world_size)]
+            else:
+                gather_list = None
+            torch.distributed.gather(
+                input_, gather_list, dst=self.ranks[dst],
+                group=self.device_group,
+            )
         if self.rank_in_group == dst:
             output_tensor = torch.cat(gather_list, dim=dim)
         else:
