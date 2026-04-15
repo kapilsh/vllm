@@ -78,7 +78,8 @@ def worker_fn():
 @pytest.mark.skipif(
     torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
 )
-@pytest.mark.parametrize("use_torchcomms", [False, True])
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
 def test_pynccl(use_torchcomms):
     distributed_run(worker_fn, 2, use_torchcomms=use_torchcomms)
 
@@ -191,8 +192,10 @@ def all_gather_worker_fn():
 @pytest.mark.skipif(
     torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
 )
-def test_pynccl_all_gather():
-    distributed_run(all_gather_worker_fn, 2)
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
+def test_pynccl_all_gather(use_torchcomms):
+    distributed_run(all_gather_worker_fn, 2, use_torchcomms=use_torchcomms)
 
 
 @worker_fn_wrapper
@@ -226,8 +229,10 @@ def all_gatherv_worker_fn():
 @pytest.mark.skipif(
     torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
 )
-def test_pynccl_all_gatherv():
-    distributed_run(all_gatherv_worker_fn, 2)
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
+def test_pynccl_all_gatherv(use_torchcomms):
+    distributed_run(all_gatherv_worker_fn, 2, use_torchcomms=use_torchcomms)
 
 
 @worker_fn_wrapper
@@ -266,8 +271,10 @@ def reduce_scatter_worker_fn():
 @pytest.mark.skipif(
     torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
 )
-def test_pynccl_reduce_scatter():
-    distributed_run(reduce_scatter_worker_fn, 2)
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
+def test_pynccl_reduce_scatter(use_torchcomms):
+    distributed_run(reduce_scatter_worker_fn, 2, use_torchcomms=use_torchcomms)
 
 
 @worker_fn_wrapper
@@ -304,15 +311,19 @@ def reduce_scatterv_worker_fn():
 @pytest.mark.skipif(
     torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
 )
-def test_pynccl_reduce_scatterv():
-    distributed_run(reduce_scatterv_worker_fn, 2)
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
+def test_pynccl_reduce_scatterv(use_torchcomms):
+    distributed_run(reduce_scatterv_worker_fn, 2, use_torchcomms=use_torchcomms)
 
 
 @pytest.mark.skipif(
     torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
 )
-def test_pynccl_with_cudagraph():
-    distributed_run(worker_fn_with_cudagraph, 2)
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
+def test_pynccl_with_cudagraph(use_torchcomms):
+    distributed_run(worker_fn_with_cudagraph, 2, use_torchcomms=use_torchcomms)
 
 
 @worker_fn_wrapper
@@ -336,8 +347,10 @@ def send_recv_worker_fn():
 @pytest.mark.skipif(
     torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs to run the test."
 )
-def test_pynccl_send_recv():
-    distributed_run(send_recv_worker_fn, 2)
+@pytest.mark.parametrize("use_torchcomms", [False, True],
+                         ids=["standard", "torchcomms"])
+def test_pynccl_send_recv(use_torchcomms):
+    distributed_run(send_recv_worker_fn, 2, use_torchcomms=use_torchcomms)
 
 
 @worker_fn_wrapper
